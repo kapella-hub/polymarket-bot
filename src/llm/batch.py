@@ -9,8 +9,9 @@ import structlog
 from src.config import settings
 from src.db.database import async_session
 from src.db.repositories import MarketRepository, PositionRepository, SignalRepository
+from src.enrichment.cross_platform import CrossPlatformScraper
 from src.llm.claude_runner import ClaudeRunner
-from src.llm.prompts import render_evaluation_prompt
+from src.llm.power_prompt import build_power_prompt
 from src.markets.models import MarketInfo, Outcome
 
 logger = structlog.get_logger()
@@ -26,8 +27,13 @@ class BatchScheduler:
     4. Markets with fresh signals (skip)
     """
 
-    def __init__(self, runner: Optional[ClaudeRunner] = None):
+    def __init__(
+        self,
+        runner: Optional[ClaudeRunner] = None,
+        scraper: Optional[CrossPlatformScraper] = None,
+    ):
         self._runner = runner or ClaudeRunner()
+        self._scraper = scraper or CrossPlatformScraper()
 
     async def run_batch(self) -> int:
         """Run one evaluation batch. Returns count evaluated."""
@@ -89,14 +95,18 @@ class BatchScheduler:
         return sorted(markets, key=sort_key)
 
     async def _run_single(self, market: MarketInfo) -> bool:
-        """Evaluate one market via Claude CLI."""
-        prompt = render_evaluation_prompt(market)
-
+        """Evaluate one market via power prompt with cross-platform intel."""
         logger.info(
             "evaluating_market",
             market_id=market.id,
             question=market.question[:80],
         )
+
+        # Gather cross-platform intelligence (independent signals)
+        cross_platform = await self._scraper.gather(market.question, market.category)
+
+        # Build power prompt with all context
+        prompt = build_power_prompt(market, cross_platform)
 
         result = await self._runner.evaluate(prompt)
         if result is None:

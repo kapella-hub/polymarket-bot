@@ -26,8 +26,8 @@ from src.backtest.harness import (
 )
 from src.enrichment.cross_platform import CrossPlatformScraper
 from src.llm.claude_runner import ClaudeRunner
-from src.llm.multi_framing import MultiFramingAnalyzer
-from src.llm.superforecaster import SuperforecasterProtocol
+from src.llm.power_prompt import build_power_prompt
+from src.markets.models import MarketInfo, Outcome
 
 
 @dataclass
@@ -70,74 +70,55 @@ async def run_naive(
     return (output.probability if output else None, elapsed)
 
 
+def _market_to_info(market: ResolvedMarket) -> MarketInfo:
+    """Convert ResolvedMarket to MarketInfo for prompt building."""
+    return MarketInfo(
+        id=market.id,
+        question=market.question,
+        category=market.category,
+        volume=market.volume,
+        outcomes=[
+            Outcome(name=market.outcomes[0], clob_token_id="", price=None),
+            Outcome(name=market.outcomes[1], clob_token_id="", price=None),
+        ] if len(market.outcomes) >= 2 else [],
+        description=market.description,
+        resolution_source=market.resolution_source,
+    )
+
+
 async def run_enhanced(
     market: ResolvedMarket,
-    protocol: SuperforecasterProtocol,
+    runner: ClaudeRunner,
     scraper: CrossPlatformScraper,
-    framing: MultiFramingAnalyzer,
 ) -> ComparisonResult:
-    """Run the full enhanced pipeline."""
+    """Run the refactored enhanced pipeline: cross-platform data + power prompt.
+
+    1 data gather + 1 Claude call (vs 6 calls before).
+    """
     actual = 1.0 if market.yes_won else 0.0
     result = ComparisonResult(market=market, actual_outcome=actual)
 
     start = time.monotonic()
 
-    # 1. Cross-platform intelligence (run concurrently with step 1 of superforecaster)
-    cross_task = asyncio.create_task(scraper.gather(market.question, market.category))
-
-    # 2. Multi-framing analysis (run concurrently)
-    framing_task = asyncio.create_task(framing.evaluate(market.question))
-
-    # 3. Superforecaster protocol (sequential 3-step chain)
-    cross_intel = await cross_task
-    cross_context = cross_intel.format_for_prompt()
+    # 1. Gather cross-platform intelligence (independent signals)
+    cross_intel = await scraper.gather(market.question, market.category)
     result.cross_platform_avg = cross_intel.average_probability
 
-    forecast = await protocol.evaluate(
-        question=market.question,
-        description=market.description or "",
-        cross_platform_context=cross_context,
-    )
+    # 2. Build power prompt with all context in one call
+    market_info = _market_to_info(market)
+    prompt = build_power_prompt(market_info, cross_intel)
 
-    framing_result = await framing_task
+    # 3. Single Claude evaluation with full context
+    output = await runner.evaluate(prompt)
 
     result.enhanced_time = time.monotonic() - start
 
-    # Populate component details
-    if forecast:
-        result.base_rate = forecast.base_rate
-
-    if framing_result.has_results:
-        result.disagreement_score = framing_result.disagreement_score
-        for f in framing_result.framings:
-            if f.framing == "analyst":
-                result.framing_analyst = f.probability
-            elif f.framing == "expert":
-                result.framing_expert = f.probability
-            elif f.framing == "contrarian":
-                result.framing_contrarian = f.probability
-
-    # Combine: weighted average of superforecaster and multi-framing consensus
-    probs = []
-    weights = []
-
-    if forecast and forecast.probability is not None:
-        probs.append(forecast.probability)
-        weights.append(forecast.confidence * 2)  # Superforecaster gets 2x weight
-
-    if framing_result.consensus_probability is not None:
-        probs.append(framing_result.consensus_probability)
-        # Lower weight when disagreement is high (signal is noisier)
-        framing_weight = 1.0 * (1.0 - framing_result.disagreement_score * 0.5)
-        weights.append(framing_weight)
-
-    if probs and sum(weights) > 0:
-        result.enhanced_prob = sum(p * w for p, w in zip(probs, weights)) / sum(weights)
-        result.enhanced_prob = max(0.0, min(1.0, result.enhanced_prob))
-        result.enhanced_brier = (result.enhanced_prob - actual) ** 2
+    if output:
+        result.enhanced_prob = output.probability
+        result.enhanced_brier = (output.probability - actual) ** 2
         result.enhanced_correct = (
-            (result.enhanced_prob > 0.5 and actual == 1.0)
-            or (result.enhanced_prob < 0.5 and actual == 0.0)
+            (output.probability > 0.5 and actual == 1.0)
+            or (output.probability < 0.5 and actual == 0.0)
         )
 
     return result
@@ -149,19 +130,18 @@ async def main():
     )
     parser.add_argument("--count", type=int, default=10)
     parser.add_argument("--min-volume", type=float, default=500_000)
+    parser.add_argument("--closed-after", type=str, default=None, help="Only markets closed after this date (e.g., 2025-06)")
     args = parser.parse_args()
 
     print(f"Fetching {args.count} resolved markets...")
-    markets = await fetch_resolved_markets(count=args.count, min_volume=args.min_volume)
+    markets = await fetch_resolved_markets(count=args.count, min_volume=args.min_volume, closed_after=args.closed_after)
     print(f"Found {len(markets)} markets\n")
 
     if not markets:
         return
 
     runner = ClaudeRunner(timeout=90, max_retries=1)
-    protocol = SuperforecasterProtocol(runner)
     scraper = CrossPlatformScraper()
-    framing_analyzer = MultiFramingAnalyzer(runner)
 
     results: list[ComparisonResult] = []
 
@@ -192,42 +172,21 @@ async def main():
         else:
             print(" FAILED")
 
-        # Run enhanced
-        print("  Running enhanced pipeline...", end="", flush=True)
-        enhanced = await run_enhanced(market, protocol, scraper, framing_analyzer)
+        # Run enhanced (power prompt: 1 data gather + 1 Claude call)
+        print("  Running power prompt...", end="", flush=True)
+        enhanced = await run_enhanced(market, runner, scraper)
         result.enhanced_prob = enhanced.enhanced_prob
         result.enhanced_brier = enhanced.enhanced_brier
         result.enhanced_correct = enhanced.enhanced_correct
         result.enhanced_time = enhanced.enhanced_time
-        result.base_rate = enhanced.base_rate
         result.cross_platform_avg = enhanced.cross_platform_avg
-        result.disagreement_score = enhanced.disagreement_score
-        result.framing_analyst = enhanced.framing_analyst
-        result.framing_expert = enhanced.framing_expert
-        result.framing_contrarian = enhanced.framing_contrarian
 
         if result.enhanced_prob is not None:
             direction = "OK" if result.enhanced_correct else "MISS"
-            print(f" {result.enhanced_prob:.0%} ({direction}) [{result.enhanced_time:.0f}s]")
+            xplat = f" | xplat={result.cross_platform_avg:.0%}" if result.cross_platform_avg is not None else ""
+            print(f" {result.enhanced_prob:.0%} ({direction}) [{result.enhanced_time:.0f}s]{xplat}")
         else:
             print(" FAILED")
-
-        # Show components
-        parts = []
-        if result.base_rate is not None:
-            parts.append(f"base_rate={result.base_rate:.0%}")
-        if result.cross_platform_avg is not None:
-            parts.append(f"xplat={result.cross_platform_avg:.0%}")
-        if result.framing_analyst is not None:
-            parts.append(f"analyst={result.framing_analyst:.0%}")
-        if result.framing_expert is not None:
-            parts.append(f"expert={result.framing_expert:.0%}")
-        if result.framing_contrarian is not None:
-            parts.append(f"contrarian={result.framing_contrarian:.0%}")
-        if result.disagreement_score is not None:
-            parts.append(f"disagree={result.disagreement_score:.2f}")
-        if parts:
-            print(f"  Components: {' | '.join(parts)}")
 
         results.append(result)
 

@@ -145,6 +145,7 @@ class BacktestResult:
 async def fetch_resolved_markets(
     count: int = 50,
     min_volume: float = 100_000,
+    closed_after: Optional[str] = None,
 ) -> list[ResolvedMarket]:
     """Fetch resolved markets from Gamma API."""
     markets = []
@@ -170,6 +171,12 @@ async def fetch_resolved_markets(
                 vol = float(raw.get("volumeNum", 0))
                 if vol < min_volume:
                     continue
+
+                # Date filter: skip markets closed before cutoff
+                if closed_after:
+                    closed_time = raw.get("closedTime", "")
+                    if closed_time and closed_time < closed_after:
+                        continue
 
                 outcomes = _parse_json(raw.get("outcomes", "[]"))
                 prices = _parse_json(raw.get("outcomePrices", "[]"))
@@ -397,10 +404,11 @@ async def main():
     parser = argparse.ArgumentParser(description="Backtest Claude against resolved Polymarket markets")
     parser.add_argument("--count", type=int, default=20, help="Number of markets to evaluate")
     parser.add_argument("--min-volume", type=float, default=100_000, help="Minimum market volume in USD")
+    parser.add_argument("--closed-after", type=str, default=None, help="Only markets closed after this date (e.g., 2025-06)")
     args = parser.parse_args()
 
     print(f"Fetching {args.count} resolved markets (min volume: ${args.min_volume:,.0f})...")
-    markets = await fetch_resolved_markets(count=args.count, min_volume=args.min_volume)
+    markets = await fetch_resolved_markets(count=args.count, min_volume=args.min_volume, closed_after=args.closed_after)
     print(f"Found {len(markets)} resolved markets")
 
     if not markets:
