@@ -12,6 +12,7 @@ unavailable should never block trading operations.
 """
 
 import json
+import os
 from typing import Optional
 
 import httpx
@@ -21,10 +22,10 @@ from src.config import settings
 
 logger = structlog.get_logger()
 
-# NexusStack service URLs (same host, different ports)
-CORTEX_URL = "http://localhost:8100"
-SENTINEL_URL = "http://localhost:8300"
-RELAY_URL = "http://localhost:8200"
+# NexusStack service URLs — defaults match VPS deployment
+CORTEX_URL = os.environ.get("NEXUS_CORTEX_URL", "http://localhost:8100")
+SENTINEL_URL = os.environ.get("NEXUS_SENTINEL_URL", "http://localhost:8060")
+RELAY_URL = os.environ.get("NEXUS_RELAY_URL", "http://localhost:8050")
 
 
 class NexusClient:
