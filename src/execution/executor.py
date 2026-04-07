@@ -31,10 +31,12 @@ class ExecutionEngine:
         exchange: Optional[ExchangeAdapter],
         risk: RiskController,
         intents: Optional[IntentManager] = None,
+        nexus=None,
     ):
         self._exchange = exchange
         self._risk = risk
         self._intents = intents or IntentManager()
+        self._nexus = nexus
         self._mode = settings.execution_mode
 
     async def process(self, decision: TradeDecision) -> bool:
@@ -50,6 +52,10 @@ class ExecutionEngine:
                 market_id=decision.market_id,
                 reason=check.reason,
             )
+            if self._nexus:
+                await self._nexus.event_risk_triggered(
+                    check.reason, f"market:{decision.market_id[:16]}"
+                )
             return False
 
         # Adjust size if risk controller capped it
@@ -227,6 +233,25 @@ class ExecutionEngine:
                 price=price,
                 size=token_qty,
             )
+
+            # Push to NexusStack
+            if self._nexus:
+                await self._nexus.event_trade_executed(
+                    decision.market_id, decision.side, size, price, decision.edge,
+                )
+                await self._nexus.learn_trade(
+                    market_id=decision.market_id,
+                    question="",  # Would need market question here
+                    side=decision.side,
+                    size=size,
+                    price=price,
+                    strategy=decision.strategy.value,
+                    edge=decision.edge,
+                )
+                await self._nexus.broadcast_position_update(
+                    decision.market_id, "Yes", token_qty, size,
+                )
+
             return True
         else:
             logger.error(

@@ -31,9 +31,11 @@ class BatchScheduler:
         self,
         runner: Optional[ClaudeRunner] = None,
         scraper: Optional[CrossPlatformScraper] = None,
+        nexus=None,
     ):
         self._runner = runner or ClaudeRunner()
         self._scraper = scraper or CrossPlatformScraper()
+        self._nexus = nexus
 
     async def run_batch(self) -> int:
         """Run one evaluation batch. Returns count evaluated."""
@@ -95,18 +97,26 @@ class BatchScheduler:
         return sorted(markets, key=sort_key)
 
     async def _run_single(self, market: MarketInfo) -> bool:
-        """Evaluate one market via power prompt with cross-platform intel."""
+        """Evaluate one market via power prompt with cross-platform intel + Cortex calibration."""
         logger.info(
             "evaluating_market",
             market_id=market.id,
             question=market.question[:80],
         )
 
-        # Gather cross-platform intelligence (independent signals)
+        # 1. Recall past calibration from NexusCortex
+        calibration_note = ""
+        if self._nexus:
+            cal = await self._nexus.recall_calibration(market.question, market.category)
+            if cal:
+                calibration_note = cal
+                logger.info("calibration_recalled", market_id=market.id, preview=cal[:100])
+
+        # 2. Gather cross-platform intelligence (independent signals)
         cross_platform = await self._scraper.gather(market.question, market.category)
 
-        # Build power prompt with all context
-        prompt = build_power_prompt(market, cross_platform)
+        # 3. Build power prompt with all context + calibration
+        prompt = build_power_prompt(market, cross_platform, calibration_note)
 
         result = await self._runner.evaluate(prompt)
         if result is None:
@@ -142,6 +152,18 @@ class BatchScheduler:
             edge=f"{edge:+.3f}",
             confidence=result.confidence,
         )
+
+        # 4. Learn this evaluation in NexusCortex for future calibration
+        if self._nexus:
+            await self._nexus.learn_evaluation(
+                market_id=market.id,
+                question=market.question,
+                estimated_prob=result.probability,
+                market_price=market_price,
+                confidence=result.confidence,
+                category=market.category,
+            )
+
         return True
 
     @staticmethod

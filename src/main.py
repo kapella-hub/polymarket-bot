@@ -23,6 +23,7 @@ from src.execution.executor import ExecutionEngine
 from src.llm.batch import BatchScheduler
 from src.markets.discovery import GammaAPIClient
 from src.markets.filters import MarketFilter
+from src.nexus.client import NexusClient
 from src.risk.controller import RiskController
 
 logger = structlog.get_logger()
@@ -34,6 +35,7 @@ _filter: MarketFilter | None = None
 _batch_scheduler: BatchScheduler | None = None
 _ensemble: EnsembleEngine | None = None
 _executor: ExecutionEngine | None = None
+_nexus: NexusClient | None = None
 _shutdown_event = asyncio.Event()
 
 
@@ -185,7 +187,7 @@ async def _strategy_loop() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown lifecycle."""
-    global _exchange, _gamma, _filter, _batch_scheduler, _ensemble, _executor
+    global _exchange, _gamma, _filter, _batch_scheduler, _ensemble, _executor, _nexus
 
     logger.info(
         "bot_starting",
@@ -208,12 +210,16 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning("exchange_connect_failed", error=str(e))
 
+    # Initialize NexusStack integration
+    _nexus = NexusClient()
+
     # Initialize LLM batch scheduler, ensemble, and execution
-    _batch_scheduler = BatchScheduler()
+    _batch_scheduler = BatchScheduler(nexus=_nexus)
     _ensemble = EnsembleEngine(alphas=[LLMAlpha(), OrderBookAlpha()])
     _executor = ExecutionEngine(
         exchange=_exchange,
         risk=RiskController(),
+        nexus=_nexus,
     )
 
     # Start background tasks
@@ -224,6 +230,7 @@ async def lifespan(app: FastAPI):
     ]
 
     logger.info("bot_started", mode=settings.execution_mode.value)
+    await _nexus.event_bot_started(settings.execution_mode.value)
 
     yield
 
@@ -236,8 +243,10 @@ async def lifespan(app: FastAPI):
             await t
         except asyncio.CancelledError:
             pass
+    await _nexus.event_bot_stopped()
     if _gamma:
         await _gamma.close()
+    await _nexus.close()
     await engine.dispose()
     logger.info("bot_stopped")
 
