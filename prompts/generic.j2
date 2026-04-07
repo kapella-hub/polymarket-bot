@@ -1,0 +1,41 @@
+{{ system_prompt }}
+
+---
+
+## Market to Evaluate
+
+**Question:** {{ question }}
+
+**Current Market Price (YES):** ${{ "%.2f"|format(yes_price) }} (implying {{ "%.0f"|format(yes_price * 100) }}% probability)
+{% if no_price is not none %}
+**Current Market Price (NO):** ${{ "%.2f"|format(no_price) }}
+{% endif %}
+
+**Category:** {{ category or "Uncategorized" }}
+
+{% if end_date %}
+**Resolution Date:** {{ end_date }}
+**Time Remaining:** {{ time_remaining }}
+{% endif %}
+
+{% if description %}
+**Description:** {{ description }}
+{% endif %}
+
+{% if resolution_source %}
+**Resolution Source:** {{ resolution_source }}
+{% endif %}
+
+{% if volume %}
+**Market Volume:** ${{ "{:,.0f}"|format(volume) }}
+**Market Liquidity:** ${{ "{:,.0f}"|format(liquidity) }}
+{% endif %}
+
+{% if enrichment_context %}
+## Additional Context
+{{ enrichment_context }}
+{% endif %}
+
+---
+
+Analyze this market and output your probability estimate as JSON.
