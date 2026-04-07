@@ -261,16 +261,20 @@ class SuperforecasterProtocol:
         return await self._call_and_parse(prompt, "step3")
 
     async def _call_and_parse(self, prompt: str, step_name: str) -> Optional[dict]:
-        """Run Claude CLI and parse JSON output."""
-        output = await self._runner.evaluate(prompt)
-        if output is None:
-            return None
-        # The runner returns LLMSignalOutput, but we need raw dict for intermediate steps
-        # Re-run the raw CLI call instead
+        """Run Claude CLI and parse raw JSON output.
+
+        Uses _run_cli directly (not evaluate) because each step
+        has a different JSON schema — we parse the dict ourselves
+        rather than validating against LLMSignalOutput.
+        """
         raw = await self._runner._run_cli(prompt)
         if raw is None:
+            logger.warning("superforecaster_no_output", step=step_name)
             return None
-        return _extract_json(raw)
+        result = _extract_json(raw)
+        if result is None:
+            logger.warning("superforecaster_parse_failed", step=step_name, preview=raw[:200])
+        return result
 
 
 def _extract_json(text: str) -> Optional[dict]:
