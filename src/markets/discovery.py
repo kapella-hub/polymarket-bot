@@ -1,5 +1,6 @@
 """Gamma API client for market discovery."""
 
+import json
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -77,16 +78,17 @@ class GammaAPIClient:
                 return None
 
             # Parse outcomes and token IDs
+            # Gamma API returns these as JSON-encoded strings, not arrays
             outcomes = []
-            clob_token_ids = raw.get("clobTokenIds", [])
-            outcome_names = raw.get("outcomes", [])
-            outcome_prices = raw.get("outcomePrices", [])
+            clob_token_ids = _parse_json_field(raw.get("clobTokenIds", []))
+            outcome_names = _parse_json_field(raw.get("outcomes", []))
+            outcome_prices = _parse_json_field(raw.get("outcomePrices", []))
 
             for i, token_id in enumerate(clob_token_ids):
                 name = outcome_names[i] if i < len(outcome_names) else f"Outcome {i}"
                 price = (
-                    float(outcome_prices[i])
-                    if i < len(outcome_prices) and outcome_prices[i]
+                    _safe_float(outcome_prices[i])
+                    if i < len(outcome_prices)
                     else None
                 )
                 outcomes.append(Outcome(name=name, clob_token_id=str(token_id), price=price))
@@ -115,8 +117,8 @@ class GammaAPIClient:
                 question=raw.get("question", ""),
                 category=raw.get("category"),
                 end_date=end_date,
-                volume=_safe_float(raw.get("volume")) or 0.0,
-                liquidity=_safe_float(raw.get("liquidity")) or 0.0,
+                volume=_safe_float(raw.get("volumeNum", raw.get("volume"))) or 0.0,
+                liquidity=_safe_float(raw.get("liquidityNum", raw.get("liquidity"))) or 0.0,
                 best_bid=best_bid,
                 best_ask=best_ask,
                 spread=spread,
@@ -129,6 +131,19 @@ class GammaAPIClient:
         except Exception as e:
             logger.warning("market_parse_error", error=str(e), raw_id=raw.get("id"))
             return None
+
+
+def _parse_json_field(val):
+    """Parse a field that may be a JSON-encoded string or already a list."""
+    if isinstance(val, list):
+        return val
+    if isinstance(val, str):
+        try:
+            parsed = json.loads(val)
+            return parsed if isinstance(parsed, list) else [parsed]
+        except (json.JSONDecodeError, TypeError):
+            return []
+    return []
 
 
 def _safe_float(val) -> Optional[float]:
