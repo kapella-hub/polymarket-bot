@@ -49,6 +49,7 @@ class Settings(BaseSettings):
     llm_timeout_seconds: int = 60
     llm_max_retries: int = 2
     llm_signal_ttl_seconds: int = 1800  # 30 min before signal is stale
+    llm_model: str = "sonnet"  # Claude model: "sonnet", "haiku", "opus"
 
     # --- Strategy Loop ---
     strategy_loop_interval_seconds: int = 30

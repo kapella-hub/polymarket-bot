@@ -91,10 +91,15 @@ class ClaudeRunner:
         Arguments are passed as a list — no shell interpolation, no
         injection risk. This is the Python equivalent of execFile.
         """
-        proc = await asyncio.create_subprocess_exec(
+        cmd = [
             "claude",
             "-p", prompt,
             "--output-format", "json",
+            "--model", settings.llm_model,
+        ]
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
