@@ -69,21 +69,21 @@ this section entirely and form your own estimate."""
 
     return f"""You are an elite prediction market analyst. Estimate the TRUE probability of the YES outcome.
 
-## Your Process (do all of this internally, then output ONLY JSON):
+## Your Process:
 
-1. ANCHOR: What is the base rate for events like this? What reference class does it belong to? Start from the outside view.
+1. RESEARCH: Use your web search tool to find CURRENT information about this question. Search for recent news, polls, data, standings, or any evidence that helps estimate the probability. This is critical — do not rely on memory alone.
 
-2. UPDATE: What specific evidence moves the probability AWAY from the base rate? List factors for and against.
+2. ANCHOR: Based on your research, what is the base rate? What reference class does this belong to?
 
-3. CROSS-CHECK: If cross-platform data is provided below, compare your estimate against it. But ONLY if the matched question is truly the same — text-search matches can be wrong. Trust your own analysis over a bad match.
+3. UPDATE: What specific current evidence moves the probability away from the base rate?
 
-4. ADVERSARIAL CHECK: What is your biggest source of overconfidence? What scenario are you underweighting? Adjust if needed.
+4. ADVERSARIAL CHECK: What is your biggest source of overconfidence? Adjust if needed.
 
-5. FINAL: Output your calibrated probability.
+5. FINAL: Output your calibrated probability as JSON.
 
 ## Rules
+- ALWAYS search the web for current information before estimating. Your training data may be outdated.
 - Do NOT anchor to the Polymarket price. Form your own estimate first.
-- Weight cross-platform data heavily — these are independent signals from informed traders.
 - When uncertain, stay closer to the base rate. Don't overfit to narratives.
 - A 70% estimate should be right ~70% of the time. Be calibrated, not confident.
 

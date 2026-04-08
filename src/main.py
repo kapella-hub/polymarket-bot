@@ -17,6 +17,7 @@ from src.db.models import Base
 from src.db.repositories import MarketRepository, PositionRepository, SignalRepository
 from src.alpha.llm_signal import LLMAlpha
 from src.alpha.orderbook import OrderBookAlpha
+from src.alpha.smart_money import SmartMoneyAlpha, SmartMoneyTracker
 from src.ensemble.engine import EnsembleEngine
 from src.exchange.polymarket import PolymarketAdapter
 from src.execution.executor import ExecutionEngine
@@ -215,7 +216,12 @@ async def lifespan(app: FastAPI):
 
     # Initialize LLM batch scheduler, ensemble, and execution
     _batch_scheduler = BatchScheduler(nexus=_nexus)
-    _ensemble = EnsembleEngine(alphas=[LLMAlpha(), OrderBookAlpha()])
+    _smart_money = SmartMoneyTracker()
+    _ensemble = EnsembleEngine(alphas=[
+        LLMAlpha(),
+        OrderBookAlpha(),
+        SmartMoneyAlpha(tracker=_smart_money),
+    ])
     _executor = ExecutionEngine(
         exchange=_exchange,
         risk=RiskController(),

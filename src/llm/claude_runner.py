@@ -96,6 +96,7 @@ class ClaudeRunner:
             "-p", prompt,
             "--output-format", "json",
             "--model", settings.llm_model,
+            "--allowedTools", "mcp__fetch,WebSearch,WebFetch",
         ]
 
         proc = await asyncio.create_subprocess_exec(
