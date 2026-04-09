@@ -216,7 +216,8 @@ async def _strategy_loop() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown lifecycle."""
-    global _exchange, _gamma, _filter, _batch_scheduler, _cross_market, _ensemble, _executor, _nexus
+    global _exchange, _gamma, _filter, _batch_scheduler, _cross_market, _ensemble, _executor, _nexus, _shutdown_event
+    _shutdown_event = asyncio.Event()  # Fresh event per startup — survives uvicorn --reload
 
     logger.info(
         "bot_starting",
