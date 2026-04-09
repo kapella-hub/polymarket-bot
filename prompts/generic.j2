@@ -6,7 +6,11 @@
 
 **Question:** {{ question }}
 
-**Current Market Price (YES):** ${{ "%.2f"|format(yes_price) }} (implying {{ "%.0f"|format(yes_price * 100) }}% probability)
+{% if yes_price is not none %}
+**Current Market Price (YES):** ${{ "%.2f"|format(yes_price) }} (implying {{ "%.0f"|format(yes_price * 100) }}%)
+{% else %}
+**Current Market Price (YES):** unavailable
+{% endif %}
 {% if no_price is not none %}
 **Current Market Price (NO):** ${{ "%.2f"|format(no_price) }}
 {% endif %}

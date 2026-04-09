@@ -122,6 +122,7 @@ class ClaudeRunner:
                 returncode=proc.returncode,
                 stderr=err_msg[:500],
             )
+            return None
 
         output = stdout.decode("utf-8", errors="replace").strip() if stdout else None
         return output

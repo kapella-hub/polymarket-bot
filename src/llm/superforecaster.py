@@ -192,13 +192,14 @@ class SuperforecasterProtocol:
         )
         if step3 is None:
             # Fall back to step 2 estimate
-            result.probability = result.evidence_adjusted
+            result.probability = result.evidence_adjusted if result.evidence_adjusted is not None else 0.5
             result.confidence = 0.5
             result.reasoning = f"Evidence-adjusted (no adversarial check): {evidence_summary}"
             result.total_time_seconds = time.monotonic() - start
             return result
 
-        result.probability = max(0.0, min(1.0, step3.get("probability", result.evidence_adjusted)))
+        raw_prob = step3.get("probability", result.evidence_adjusted)
+        result.probability = max(0.0, min(1.0, raw_prob if raw_prob is not None else 0.5))
         result.confidence = max(0.0, min(1.0, step3.get("confidence", 0.5)))
         result.reasoning = step3.get("reasoning", "")
         result.adversarial_arguments = step3.get("adversarial_arguments", [])
