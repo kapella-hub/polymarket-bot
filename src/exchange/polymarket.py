@@ -172,6 +172,13 @@ class PolymarketAdapter(ExchangeAdapter):
             )
 
             order_id = result.get("orderID", result.get("id", ""))
+            if not order_id:
+                logger.error(
+                    "order_no_id_in_response",
+                    token_id=token_id,
+                    response_keys=list(result.keys()) if isinstance(result, dict) else str(type(result)),
+                )
+                return OrderResult(order_id="", success=False, message="No order ID in exchange response")
             logger.info(
                 "order_placed",
                 token_id=token_id,
