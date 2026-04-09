@@ -6,7 +6,7 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -14,18 +14,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
-
-  bot:
-    build: .
-    env_file: .env
-    ports:
-      - "8000:8000"
-    depends_on:
-      postgres:
-        condition: service_healthy
     restart: unless-stopped
-    environment:
-      PM_DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/polymarket_bot
 
   # Optional monitoring stack
   prometheus:
@@ -33,15 +22,7 @@ services:
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml
     ports:
-      - "9090:9090"
-    profiles: ["monitoring"]
-
-  grafana:
-    image: grafana/grafana:latest
-    ports:
-      - "3000:3000"
-    environment:
-      GF_SECURITY_ADMIN_PASSWORD: admin
+      - "9091:9090"
     profiles: ["monitoring"]
 
 volumes:

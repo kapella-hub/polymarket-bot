@@ -61,6 +61,21 @@ class EnsembleEngine:
         if abs(combined_edge) < settings.min_edge_threshold:
             return None
 
+        # --- Bayesian Combo Strategy Filter ---
+        if settings.strategy_filter_enabled:
+            filtered = self._bayesian_filter(
+                market, context, combined_edge, combined_confidence,
+            )
+            if filtered:
+                logger.info(
+                    "strategy_filtered",
+                    market_id=market.id,
+                    reason=filtered,
+                    edge=f"{combined_edge:+.3f}",
+                    confidence=f"{combined_confidence:.2f}",
+                )
+                return None
+
         # Determine trade direction
         if combined_edge > 0:
             # YES is underpriced — buy YES
@@ -72,13 +87,25 @@ class EnsembleEngine:
             token_id = market.clob_token_id_no
             combined_edge = abs(combined_edge)  # Flip to positive for sizing
 
-        # Kelly criterion position sizing
-        market_price = market.best_bid or market.last_price or 0.5
+        # Kelly criterion position sizing: f* = (p*b - q) / b
+        if market.best_bid is not None:
+            market_price = market.best_bid
+        elif market.last_price is not None:
+            market_price = market.last_price
+        else:
+            market_price = 0.5
         if side == "buy" and token_id == market.clob_token_id_no:
             market_price = 1.0 - market_price  # NO token price
 
-        odds = (1.0 / market_price - 1.0) if market_price > 0 and market_price < 1 else 1.0
-        kelly = combined_edge / odds if odds > 0 else 0
+        if 0 < market_price < 1:
+            b = (1.0 / market_price) - 1.0  # decimal odds
+            prob = market_price + combined_edge  # estimated true prob
+            prob = max(0.01, min(0.99, prob))
+            q = 1.0 - prob
+            kelly = (prob * b - q) / b if b > 0 else 0
+            kelly = max(kelly, 0)
+        else:
+            kelly = 0
         kelly_sized = kelly * settings.kelly_fraction  # Fractional Kelly
 
         # Convert to USDC size (capped by per-market limit)
@@ -113,3 +140,63 @@ class EnsembleEngine:
             suggested_size=suggested_size,
             notes="; ".join(notes_parts),
         )
+
+    @staticmethod
+    def _bayesian_filter(
+        market: Market,
+        context: dict,
+        combined_edge: float,
+        combined_confidence: float,
+    ) -> str:
+        """Bayesian combo filter: require multiple signals to align before trading.
+
+        Returns empty string if trade passes, or rejection reason if filtered.
+        Scoring: edge size, confidence, directional conviction, category.
+        Must meet min_bayesian_score (default 2) to trade.
+        """
+        # Category blacklist — hard reject
+        blacklist = {
+            c.strip()
+            for c in settings.category_blacklist.split(",")
+            if c.strip()
+        }
+        if market.category and market.category in blacklist:
+            return f"category_blacklisted:{market.category}"
+
+        abs_edge = abs(combined_edge)
+
+        # Edge * confidence product gate
+        if abs_edge * combined_confidence < settings.min_edge_confidence_product:
+            return f"edge_conf_product:{abs_edge * combined_confidence:.3f}<{settings.min_edge_confidence_product}"
+
+        # Volume-adjusted edge: higher volume markets need more edge
+        vol_scale = min(market.volume / 2_000_000, 1.0)
+        required_edge = settings.volume_edge_base + settings.volume_edge_scale * vol_scale
+        if abs_edge < required_edge:
+            return f"volume_adj_edge:{abs_edge:.3f}<{required_edge:.3f}"
+
+        # Bayesian score: accumulate evidence from independent signals
+        score = 0
+
+        # Signal 1: meaningful edge
+        if abs_edge > 0.05:
+            score += 1
+        if abs_edge > 0.12:
+            score += 1
+
+        # Signal 2: confidence
+        if combined_confidence >= 0.80:
+            score += 1
+
+        # Signal 3: directional conviction from LLM signal
+        signal = context.get("signal")
+        if signal and hasattr(signal, "probability"):
+            prob = signal.probability
+            thresh = settings.min_conviction_prob
+            if prob < thresh or prob > (1.0 - thresh):
+                score += 1
+
+        if score < settings.min_bayesian_score:
+            return f"bayesian_score:{score}<{settings.min_bayesian_score}"
+
+        return ""

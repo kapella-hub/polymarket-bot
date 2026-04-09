@@ -65,6 +65,15 @@ class Settings(BaseSettings):
     kelly_fraction: float = 0.25  # Quarter-Kelly for safety
     min_edge_threshold: float = 0.05  # 5 cents minimum edge to trade
 
+    # --- Bayesian Combo Strategy Filter ---
+    strategy_filter_enabled: bool = True
+    min_edge_confidence_product: float = 0.05  # edge * confidence must exceed this
+    min_conviction_prob: float = 0.15  # prob must be < this or > (1 - this) for conviction
+    category_blacklist: str = "Sports,Pop Culture"  # Comma-separated, weak LLM categories
+    volume_edge_base: float = 0.05  # Base edge threshold for volume scaling
+    volume_edge_scale: float = 0.05  # Additional edge per $2M volume
+    min_bayesian_score: int = 2  # Minimum combined signal score to trade
+
     # --- Logging ---
     log_level: str = "INFO"
     log_format: str = "json"

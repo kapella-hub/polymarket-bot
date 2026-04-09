@@ -34,6 +34,8 @@ class GammaAPIClient:
     ) -> list[MarketInfo]:
         """Fetch active markets from Gamma API with pagination."""
         all_markets: list[MarketInfo] = []
+        event_ids: set[str] = set()
+        market_event_map: dict[str, str] = {}  # market_id -> event_id
         current_offset = offset
 
         while True:
@@ -59,6 +61,12 @@ class GammaAPIClient:
                 market = self._parse_market(raw)
                 if market:
                     all_markets.append(market)
+                    # Track event ID for category enrichment
+                    events = raw.get("events") or []
+                    if events and events[0].get("id"):
+                        eid = str(events[0]["id"])
+                        event_ids.add(eid)
+                        market_event_map[market.id] = eid
 
             if len(data) < params["limit"]:
                 break  # Last page
@@ -67,8 +75,64 @@ class GammaAPIClient:
             if len(all_markets) >= limit:
                 break
 
+        # Enrich markets with category from event tags
+        if event_ids:
+            event_tags = await self._fetch_event_tags(event_ids)
+            for market in all_markets:
+                eid = market_event_map.get(market.id)
+                if eid and eid in event_tags:
+                    market.category = event_tags[eid]
+
         logger.info("markets_discovered", count=len(all_markets))
         return all_markets
+
+    async def _fetch_event_tags(self, event_ids: set[str]) -> dict[str, str]:
+        """Batch-fetch primary category tag for events. Returns {event_id: category}.
+
+        Uses /events?id=X&id=Y to fetch in batches of 20. Tags include topic
+        labels like 'Politics', 'Sports', 'Crypto'. Picks the first known
+        category tag, falling back to first non-utility tag.
+        """
+        KNOWN_CATEGORIES = {
+            "Politics", "Sports", "Crypto", "Economy", "Culture",
+            "Science", "Technology", "Business", "Finance", "AI",
+            "Geopolitics", "World", "Climate & Environment",
+            "Pop Culture", "Entertainment",
+        }
+        SKIP_TAGS = {"All", "Parent For Derivative", "Earn 4%", "Hit Price"}
+
+        result: dict[str, str] = {}
+        id_list = list(event_ids)
+
+        # Batch fetch in chunks of 20
+        for i in range(0, len(id_list), 20):
+            batch = id_list[i:i + 20]
+            try:
+                params = [("id", eid) for eid in batch]
+                resp = await self._client.get("/events", params=params)
+                resp.raise_for_status()
+                events = resp.json()
+
+                for event in events:
+                    eid = str(event.get("id", ""))
+                    tags = event.get("tags") or []
+                    labels = [t["label"] for t in tags if t.get("label") not in SKIP_TAGS]
+
+                    category = None
+                    for label in labels:
+                        if label in KNOWN_CATEGORIES:
+                            category = label
+                            break
+                    if not category and labels:
+                        category = labels[0]
+
+                    if category and eid:
+                        result[eid] = category
+            except httpx.HTTPError as e:
+                logger.debug("event_tag_batch_failed", batch_size=len(batch), error=str(e))
+
+        logger.info("event_tags_enriched", events=len(result), total=len(event_ids))
+        return result
 
     def _parse_market(self, raw: dict) -> Optional[MarketInfo]:
         """Parse a raw Gamma API market response into MarketInfo."""
