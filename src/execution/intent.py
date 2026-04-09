@@ -69,12 +69,27 @@ class IntentManager:
         reason: Optional[InvalidationReason] = None,
         **extra_fields,
     ) -> bool:
-        """Transition an intent to a new state."""
+        """Transition an intent to a new state with validation."""
         async with async_session() as session:
             repo = IntentRepository(session)
 
-            # Verify valid transition
-            # In production, we'd read current state first — for now trust the caller
+            # Read current state and validate transition
+            current_state = await repo.get_state(intent_id)
+            if current_state is None:
+                logger.error("intent_not_found", intent_id=intent_id)
+                return False
+
+            valid_next = _TRANSITIONS.get(current_state, set())
+            if new_state not in valid_next:
+                logger.error(
+                    "invalid_intent_transition",
+                    intent_id=intent_id,
+                    current=current_state.value,
+                    attempted=new_state.value,
+                    valid=sorted(s.value for s in valid_next),
+                )
+                return False
+
             await repo.update_state(intent_id, new_state, reason, **extra_fields)
             await session.commit()
 

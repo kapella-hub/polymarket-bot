@@ -135,6 +135,13 @@ class IntentRepository:
             update(OrderIntent).where(OrderIntent.id == intent_id).values(**values)
         )
 
+    async def get_state(self, intent_id: int) -> Optional[IntentState]:
+        result = await self.session.execute(
+            select(OrderIntent.state).where(OrderIntent.id == intent_id)
+        )
+        row = result.scalar_one_or_none()
+        return row
+
     async def get_active(self) -> list[OrderIntent]:
         result = await self.session.execute(
             select(OrderIntent).where(
