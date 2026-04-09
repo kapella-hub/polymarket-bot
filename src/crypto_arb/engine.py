@@ -556,6 +556,13 @@ class CryptoArbEngine:
             # Poll Binance
             prices = await self.feed.poll()
 
+            # Skip trading on stale prices
+            if self.feed.age_seconds > 10:
+                if cycle % 15 == 0:  # Log every ~30s
+                    logger.warning("binance_prices_stale", age=f"{self.feed.age_seconds:.1f}s")
+                await asyncio.sleep(self.poll_interval)
+                continue
+
             # Periodic market rescan
             if time.time() - last_scan > self.scan_interval:
                 self._markets = await self.scanner.scan()

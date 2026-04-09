@@ -247,10 +247,11 @@ class FastArbDetector:
         if entry_price > self.max_entry_price:
             return None  # Market already repriced — no edge
 
-        # Calculate edge after fees (10% round-trip)
+        # Calculate edge after proportional fees on both legs
         fee_rate = 0.10
-        gross_return = (1.0 / entry_price) - 1.0  # e.g., buy at 0.45 -> 122% gross
-        net_return = gross_return - fee_rate
+        payout_after_fees = 1.0 * (1 - fee_rate)
+        cost_with_fees = entry_price * (1 + fee_rate)
+        net_return = (payout_after_fees / cost_with_fees) - 1.0
         if net_return < self.min_edge_after_fees:
             return None  # Not enough edge after fees
 
