@@ -153,6 +153,9 @@ class ExecutionEngine:
             )
             await session.commit()
 
+        # Track P&L for daily loss limit
+        self._risk.record_fill(0.0)  # Paper fills have no real P&L yet
+
         return True
 
     async def _live_execute(
@@ -248,6 +251,9 @@ class ExecutionEngine:
                     size=token_qty,
                 )
                 await session.commit()
+
+            # Track fill for risk — P&L computed on close, record 0 for open
+            self._risk.record_fill(0.0)
 
             logger.info(
                 "live_trade_executed",

@@ -61,6 +61,7 @@ class Settings(BaseSettings):
     max_portfolio_drawdown_pct: float = 0.15  # 15% drawdown halt
     max_daily_loss_usd: float = 200.0
     max_daily_loss_pct: float = 0.10  # 10% daily loss
+    bankroll_usd: float = 10000.0  # Actual account bankroll — used for Kelly sizing and risk caps
     max_correlated_exposure_usd: float = 1000.0  # Max across related markets
     kelly_fraction: float = 0.25  # Quarter-Kelly for safety
     min_edge_threshold: float = 0.05  # 5 cents minimum edge to trade

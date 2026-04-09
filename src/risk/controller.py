@@ -1,5 +1,6 @@
 """Risk controller with kill switch, position limits, and drawdown protection."""
 
+import asyncio
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -39,9 +40,15 @@ class RiskController:
         self._peak_value: float = 0.0
         self._daily_pnl: float = 0.0
         self._day_start: datetime = datetime.now(timezone.utc)
+        self._lock = asyncio.Lock()
 
     async def check(self, decision: TradeDecision) -> RiskCheck:
         """Run all risk checks against a trade decision."""
+        async with self._lock:
+            return await self._check_inner(decision)
+
+    async def _check_inner(self, decision: TradeDecision) -> RiskCheck:
+        """Run all risk checks (called under lock)."""
 
         # 1. Kill switch
         if self._kill_switch_active():
@@ -67,7 +74,7 @@ class RiskController:
         # 3. Portfolio exposure cap
         total_exposure = sum(abs(p.size * p.avg_entry_price) for p in positions)
         # Estimate portfolio value (exposure + remaining cash)
-        portfolio_value = max(total_exposure, self._peak_value) if self._peak_value > 0 else total_exposure + 10000
+        portfolio_value = max(total_exposure, self._peak_value) if self._peak_value > 0 else total_exposure + settings.bankroll_usd
         max_exposure = portfolio_value * settings.max_portfolio_exposure_pct
         remaining_portfolio_cap = max_exposure - total_exposure
         if remaining_portfolio_cap <= 0:

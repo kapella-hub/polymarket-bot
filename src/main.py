@@ -144,6 +144,9 @@ async def _strategy_loop() -> None:
 
                 markets = await market_repo.get_active()
 
+                pos_repo = PositionRepository(session)
+                positions = await pos_repo.get_all()
+
                 # Update cross-market groups for arbitrage detection
                 _cross_market.update_groups(markets)
 
@@ -189,6 +192,13 @@ async def _strategy_loop() -> None:
                     )
                     for decision in decisions:
                         await _executor.process(decision)
+
+                # Update portfolio value for drawdown tracking
+                if positions:
+                    portfolio_val = sum(
+                        abs(p.size * p.avg_entry_price) for p in positions
+                    ) + settings.bankroll_usd
+                    _executor._risk.update_portfolio_value(portfolio_val)
 
         except Exception as e:
             logger.error("strategy_loop_error", error=str(e))
