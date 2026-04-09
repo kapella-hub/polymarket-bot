@@ -252,7 +252,7 @@ class SmartMoneyAlpha(AlphaSource):
 
         for pos in positions:
             # Weight by trader PnL (more profitable = stronger signal)
-            credibility = min(pos.trader_pnl / 100_000, 3.0)  # Cap at 3x
+            credibility = max(0.0, min(pos.trader_pnl / 100_000, 3.0))  # Clamp [0, 3x]
 
             if pos.outcome.lower() in ("yes", "true", "1"):
                 yes_weight += pos.size * credibility
