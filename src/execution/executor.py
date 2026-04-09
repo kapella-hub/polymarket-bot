@@ -221,7 +221,7 @@ class ExecutionEngine:
                 intent_id,
                 exchange_order_id=result.order_id,
                 filled_price=price,
-                filled_size=size,
+                filled_size=token_qty,
             )
 
             # Record trade

@@ -192,9 +192,11 @@ class PositionRepository:
                 )
                 existing.size = new_size
             else:
-                pnl = (price - existing.avg_entry_price) * size
+                # Clamp sell size to current position — prevent negative positions
+                sell_size = min(size, existing.size)
+                pnl = (price - existing.avg_entry_price) * sell_size
                 existing.realized_pnl += pnl
-                existing.size -= size
+                existing.size -= sell_size
                 existing.cost_basis = existing.avg_entry_price * existing.size
 
 
