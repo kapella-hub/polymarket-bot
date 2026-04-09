@@ -101,7 +101,15 @@ class EnsembleEngine:
             combined_edge = abs(combined_edge)  # Flip to positive for sizing
 
         # Kelly criterion position sizing: f* = (p*b - q) / b
-        market_price = market.best_bid or market.last_price or market.best_ask
+        # Use midpoint for fair value; fall back to last_price
+        if market.best_bid is not None and market.best_ask is not None and market.best_bid > 0 and market.best_ask > 0:
+            market_price = (market.best_bid + market.best_ask) / 2
+        elif market.last_price is not None and market.last_price > 0:
+            market_price = market.last_price
+        elif market.best_ask is not None and market.best_ask > 0:
+            market_price = market.best_ask
+        else:
+            market_price = market.best_bid if market.best_bid is not None and market.best_bid > 0 else None
         if market_price is None:
             return None
         if side == "buy" and token_id == market.clob_token_id_no:
@@ -119,9 +127,8 @@ class EnsembleEngine:
         kelly_sized = kelly * settings.kelly_fraction  # Fractional Kelly
 
         # Convert to USDC size (capped by per-market limit)
-        # Bankroll is not tracked here — risk controller will cap it
         suggested_size = min(
-            kelly_sized * 10000,  # Placeholder bankroll scaling
+            kelly_sized * settings.bankroll_usd,
             settings.max_position_per_market_usd,
         )
         suggested_size = max(suggested_size, 0)

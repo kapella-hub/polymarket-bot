@@ -24,8 +24,13 @@ class LLMAlpha(AlphaSource):
         if signal is None:
             return None
 
-        # Current market price (YES outcome)
-        market_price = market.best_bid or market.last_price
+        # Use midpoint for fair value reference
+        if market.best_bid is not None and market.best_ask is not None and market.best_bid > 0 and market.best_ask > 0:
+            market_price = (market.best_bid + market.best_ask) / 2
+        elif market.last_price is not None and market.last_price > 0:
+            market_price = market.last_price
+        else:
+            market_price = market.best_bid if market.best_bid is not None and market.best_bid > 0 else None
         if market_price is None:
             return None
 
