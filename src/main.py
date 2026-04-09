@@ -231,7 +231,8 @@ async def lifespan(app: FastAPI):
 
     # Initialize components
     _gamma = GammaAPIClient()
-    _filter = MarketFilter()
+    _blacklist = [c.strip() for c in settings.category_blacklist.split(",") if c.strip()]
+    _filter = MarketFilter(category_blacklist=_blacklist)
     _exchange = PolymarketAdapter()
 
     if settings.polymarket_wallet_private_key:

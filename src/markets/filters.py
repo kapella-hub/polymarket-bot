@@ -72,8 +72,8 @@ class MarketFilter:
             if days_until_end > self.max_end_date_days:
                 return f"too_far_out ({days_until_end:.0f}d)"
 
-        if self.category_whitelist and m.category:
-            if m.category.lower() not in [c.lower() for c in self.category_whitelist]:
+        if self.category_whitelist:
+            if not m.category or m.category.lower() not in [c.lower() for c in self.category_whitelist]:
                 return f"category_not_whitelisted ({m.category})"
 
         if self.category_blacklist and m.category:
