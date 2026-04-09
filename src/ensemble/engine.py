@@ -1,5 +1,6 @@
 """Ensemble engine: combines alpha signals into trade decisions."""
 
+from datetime import datetime, timezone
 from typing import Optional
 
 import structlog
@@ -57,8 +58,20 @@ class EnsembleEngine:
         combined_edge = sum(o.edge * o.confidence for _, o in outputs) / total_weight
         combined_confidence = total_weight / len(outputs)  # Average confidence
 
-        # Minimum edge threshold
-        if abs(combined_edge) < settings.min_edge_threshold:
+        # Adaptive edge threshold: lower for near-resolution or high-confidence
+        threshold = settings.min_edge_threshold
+        if market.end_date is not None:
+            now = datetime.now(timezone.utc)
+            days_to_end = (market.end_date - now).total_seconds() / 86400
+            if 1 <= days_to_end <= 14:
+                # Up to 50% threshold reduction near resolution
+                time_factor = max(0.5, days_to_end / 14)
+                threshold *= time_factor
+        if combined_confidence > 0.7:
+            threshold *= 0.8  # 20% reduction for high confidence
+        threshold = max(threshold, 0.02)  # Hard floor at 2 cents
+
+        if abs(combined_edge) < threshold:
             return None
 
         # --- Bayesian Combo Strategy Filter ---
@@ -88,12 +101,9 @@ class EnsembleEngine:
             combined_edge = abs(combined_edge)  # Flip to positive for sizing
 
         # Kelly criterion position sizing: f* = (p*b - q) / b
-        if market.best_bid is not None:
-            market_price = market.best_bid
-        elif market.last_price is not None:
-            market_price = market.last_price
-        else:
-            market_price = 0.5
+        market_price = market.best_bid or market.last_price or market.best_ask
+        if market_price is None:
+            return None
         if side == "buy" and token_id == market.clob_token_id_no:
             market_price = 1.0 - market_price  # NO token price
 

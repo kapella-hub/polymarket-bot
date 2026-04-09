@@ -267,7 +267,7 @@ class SmartMoneyAlpha(AlphaSource):
         consensus = (yes_weight - no_weight) / total  # -1 to +1
 
         # Convert to edge: scale by confidence factor
-        market_price = market.best_bid or market.last_price or 0.5
+        market_price = market.best_bid or market.last_price or market.best_ask
         edge = consensus * 0.10  # Max 10% edge from smart money alone
 
         confidence = min(0.5, len(positions) * 0.1)  # More traders = more confident

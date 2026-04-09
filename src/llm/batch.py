@@ -70,10 +70,17 @@ class BatchScheduler:
         )
 
         count = 0
+        skipped = 0
         for db_market in batch:
             market_info = self._db_to_info(db_market)
+            if market_info.resolve_price() is None:
+                skipped += 1
+                continue
             if await self._run_single(market_info):
                 count += 1
+
+        if skipped:
+            logger.info("batch_skipped_no_price", skipped=skipped)
 
         logger.info("batch_complete", evaluated=count, attempted=len(batch))
         return count
@@ -123,7 +130,10 @@ class BatchScheduler:
             logger.warning("market_eval_failed", market_id=market.id)
             return False
 
-        market_price = market.yes_price or 0.5
+        market_price = market.resolve_price()
+        if market_price is None:
+            logger.warning("market_no_price", market_id=market.id)
+            return False
         edge = result.probability - market_price
         now = datetime.now(timezone.utc)
 
@@ -169,6 +179,8 @@ class BatchScheduler:
     @staticmethod
     def _db_to_info(db_market) -> MarketInfo:
         """Convert DB Market row to MarketInfo domain model."""
+        # Use best available price for YES outcome: best_bid → last_price → best_ask
+        yes_price = db_market.best_bid or db_market.last_price or db_market.best_ask
         return MarketInfo(
             id=db_market.id,
             question=db_market.question,
@@ -182,7 +194,7 @@ class BatchScheduler:
                 Outcome(
                     name=db_market.outcome_yes,
                     clob_token_id=db_market.clob_token_id_yes,
-                    price=db_market.best_bid,
+                    price=yes_price,
                 ),
                 Outcome(
                     name=db_market.outcome_no,

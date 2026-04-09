@@ -44,7 +44,7 @@ def render_evaluation_prompt(
     return template.render(
         system_prompt=_system_prompt,
         question=market.question,
-        yes_price=market.yes_price or 0.5,
+        yes_price=market.resolve_price() or market.yes_price,
         no_price=market.no_price,
         category=market.category,
         end_date=market.end_date.strftime("%Y-%m-%d %H:%M UTC") if market.end_date else None,

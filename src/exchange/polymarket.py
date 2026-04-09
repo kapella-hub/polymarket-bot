@@ -113,7 +113,13 @@ class PolymarketAdapter(ExchangeAdapter):
 
     async def get_order_book(self, token_id: str) -> OrderBook:
         self._ensure_connected()
-        raw = await self._retry(self._client.get_order_book, token_id)
+        try:
+            raw = await self._retry(self._client.get_order_book, token_id)
+        except Exception as e:
+            if "404" in str(e) or "No orderbook" in str(e):
+                # Market has no order book (delisted or ultra-thin) — return empty
+                return OrderBook(bids=[], asks=[], timestamp=time.time())
+            raise
 
         bids = [
             OrderBookEntry(price=float(b["price"]), size=float(b["size"]))

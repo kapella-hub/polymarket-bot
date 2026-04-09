@@ -62,7 +62,7 @@ this section entirely and form your own estimate."""
         else:
             time_block = "**Status:** Resolution date has passed"
 
-    yes_price = market.yes_price
+    yes_price = market.resolve_price()
     price_block = ""
     if yes_price is not None:
         price_block = f"**Current Polymarket price (YES):** ${yes_price:.2f} (implying {yes_price:.0%} probability)"

@@ -100,7 +100,7 @@ class ExecutionEngine:
     ) -> bool:
         """Paper mode: simulate fill against real order book."""
         # Get current order book for realistic fill simulation
-        fill_price = 0.5  # Default
+        fill_price = None
         if self._exchange:
             try:
                 book = await self._exchange.get_order_book(decision.token_id)
@@ -110,6 +110,17 @@ class ExecutionEngine:
                     fill_price = book.best_bid
             except Exception:
                 pass
+
+        if fill_price is None or fill_price <= 0:
+            logger.warning(
+                "paper_no_fill_price",
+                intent_id=intent_id,
+                market_id=decision.market_id,
+            )
+            await self._intents.invalidate(
+                intent_id, InvalidationReason.SPREAD_WIDENED
+            )
+            return False
 
         logger.info(
             "paper_trade",
@@ -165,11 +176,23 @@ class ExecutionEngine:
             )
             return False
 
-        # Set limit price: slightly better than best available
+        # Set limit price from order book — reject if no liquidity
         if decision.side == "buy":
-            price = book.best_ask if book.best_ask else 0.5
+            price = book.best_ask
         else:
-            price = book.best_bid if book.best_bid else 0.5
+            price = book.best_bid
+
+        if price is None or price <= 0:
+            logger.warning(
+                "live_no_liquidity",
+                intent_id=intent_id,
+                market_id=decision.market_id,
+                side=decision.side,
+            )
+            await self._intents.invalidate(
+                intent_id, InvalidationReason.SPREAD_WIDENED
+            )
+            return False
 
         # Arm the intent with the price
         await self._intents.arm(intent_id, price)

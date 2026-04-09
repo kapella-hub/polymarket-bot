@@ -54,3 +54,19 @@ class MarketInfo:
     def no_price(self) -> Optional[float]:
         o = self.outcome_no
         return o.price if o else None
+
+    def resolve_price(self) -> Optional[float]:
+        """Best available price for the YES outcome.
+
+        Resolution order: best_bid → best_ask → outcome price from Gamma API.
+        Skips zero values (a bid/ask of 0.0 is not useful for sizing or edge).
+        Returns None only if all sources are missing or zero.
+        """
+        if self.best_bid is not None and self.best_bid > 0:
+            return self.best_bid
+        if self.best_ask is not None and self.best_ask > 0:
+            return self.best_ask
+        p = self.yes_price
+        if p is not None and p > 0:
+            return p
+        return None

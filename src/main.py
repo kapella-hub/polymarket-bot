@@ -15,6 +15,7 @@ from src.config import settings, ExecutionMode
 from src.db.database import engine, async_session
 from src.db.models import Base
 from src.db.repositories import MarketRepository, PositionRepository, SignalRepository
+from src.alpha.cross_market import CrossMarketAlpha
 from src.alpha.llm_signal import LLMAlpha
 from src.alpha.orderbook import OrderBookAlpha
 from src.alpha.smart_money import SmartMoneyAlpha, SmartMoneyTracker
@@ -34,6 +35,7 @@ _exchange: PolymarketAdapter | None = None
 _gamma: GammaAPIClient | None = None
 _filter: MarketFilter | None = None
 _batch_scheduler: BatchScheduler | None = None
+_cross_market: CrossMarketAlpha | None = None
 _ensemble: EnsembleEngine | None = None
 _executor: ExecutionEngine | None = None
 _nexus: NexusClient | None = None
@@ -141,9 +143,25 @@ async def _strategy_loop() -> None:
                 signal_repo = SignalRepository(session)
 
                 markets = await market_repo.get_active()
+
+                # Update cross-market groups for arbitrage detection
+                _cross_market.update_groups(markets)
+
+                # Liquidity filter: only run ensemble on tradeable markets
+                tradeable = [
+                    m for m in markets
+                    if m.best_bid is not None and m.best_bid > 0
+                ]
+                skipped = len(markets) - len(tradeable)
+                if skipped:
+                    logger.debug(
+                        "strategy_skipped_illiquid", skipped=skipped,
+                        tradeable=len(tradeable),
+                    )
+
                 decisions = []
 
-                for market in markets:
+                for market in tradeable:
                     signal = await signal_repo.get_latest(market.id)
 
                     # Build context for alphas
@@ -188,7 +206,7 @@ async def _strategy_loop() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown lifecycle."""
-    global _exchange, _gamma, _filter, _batch_scheduler, _ensemble, _executor, _nexus
+    global _exchange, _gamma, _filter, _batch_scheduler, _cross_market, _ensemble, _executor, _nexus
 
     logger.info(
         "bot_starting",
@@ -217,10 +235,12 @@ async def lifespan(app: FastAPI):
     # Initialize LLM batch scheduler, ensemble, and execution
     _batch_scheduler = BatchScheduler(nexus=_nexus)
     _smart_money = SmartMoneyTracker()
+    _cross_market = CrossMarketAlpha()
     _ensemble = EnsembleEngine(alphas=[
         LLMAlpha(),
         OrderBookAlpha(),
         SmartMoneyAlpha(tracker=_smart_money),
+        _cross_market,
     ])
     _executor = ExecutionEngine(
         exchange=_exchange,
@@ -321,6 +341,181 @@ async def status():
 @app.get("/metrics")
 async def metrics():
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+# --- Dashboard ---
+
+@app.get("/dashboard")
+async def dashboard():
+    import pathlib
+    html_path = pathlib.Path(__file__).parent.parent / "dashboard" / "index.html"
+    if html_path.exists():
+        return Response(content=html_path.read_text(), media_type="text/html")
+    return Response(content="<h1>Dashboard not found</h1>", media_type="text/html")
+
+
+@app.get("/api/crypto-arb")
+async def crypto_arb_status():
+    """Read the latest crypto arb paper trading state from the log file."""
+    import json as jsonmod
+    import pathlib
+    # Prefer WS engine log, fall back to REST engine log
+    ws_log = pathlib.Path(__file__).parent.parent / "fast_arb_ws_output.log"
+    rest_log = pathlib.Path(__file__).parent.parent / "crypto_arb_output.log"
+    log_path = ws_log if ws_log.exists() and ws_log.stat().st_size > 0 else rest_log
+    result = {
+        "bankroll": None, "total_pnl": "$0.00", "total_pnl_num": 0,
+        "win_rate": "--", "roi": "--", "total_trades": 0,
+        "open": 0, "won": 0, "lost": 0, "trades": [], "prices": {},
+        "markets_scanned": 0,
+    }
+    if not log_path.exists():
+        return result
+    try:
+        lines = log_path.read_text().strip().split("\n")
+        # Parse structlog key=value lines (handles single-quoted values with spaces)
+        import re as _re
+
+        def _parse_structlog(line: str) -> dict:
+            parts = {}
+            for m in _re.finditer(r"(\w+)='([^']*)'|(\w+)=(\S+)", line):
+                if m.group(1):
+                    parts[m.group(1)] = m.group(2)
+                elif m.group(3):
+                    parts[m.group(3)] = m.group(4)
+            return parts
+
+        trades = []
+        latest_cycle = {}
+        for line in lines:
+            if "fast_trade" in line:
+                parts = _parse_structlog(line)
+                trades.append({
+                    "question": parts.get("question", parts.get("coin", "")),
+                    "side": parts.get("side", ""),
+                    "entry_price": float(parts.get("entry", "0").replace("$", "")),
+                    "size_usd": float(parts.get("size", "0").replace("$", "")),
+                    "asset": parts.get("coin", "?"),
+                    "binance_at_entry": 0,
+                    "edge": parts.get("move", ""),
+                    "confidence": parts.get("conf", ""),
+                    "status": "open",
+                    "pnl": 0,
+                })
+            elif "fast_resolved" in line:
+                parts = _parse_structlog(line)
+                coin = parts.get("coin", "")
+                status = parts.get("status", "")
+                pnl = float(parts.get("pnl", "0").replace("$", "").replace("+", ""))
+                # Match to latest open trade for this coin
+                for t in reversed(trades):
+                    if t.get("asset") == coin and t["status"] == "open":
+                        t["status"] = status
+                        t["pnl"] = pnl
+                        break
+            elif "fast_cycle" in line:
+                latest_cycle = _parse_structlog(line)
+            elif "paper_trade" in line:
+                parts = _parse_structlog(line)
+                market_q = parts.get("market", "")
+                # Extract asset from question
+                asset = "?"
+                for a in ["Bitcoin", "Ethereum", "Solana", "XRP"]:
+                    if a.lower() in market_q.lower():
+                        asset = {"bitcoin":"BTC","ethereum":"ETH","solana":"SOL","xrp":"XRP"}[a.lower()]
+                        break
+                trades.append({
+                    "question": market_q,
+                    "side": parts.get("side", ""),
+                    "entry_price": float(parts.get("entry", "0").replace("$", "")),
+                    "size_usd": float(parts.get("size", "0").replace("$", "")),
+                    "asset": asset,
+                    "binance_at_entry": float(parts.get("binance", "0").replace("$", "").replace(",", "")),
+                    "edge": parts.get("edge", ""),
+                    "confidence": parts.get("confidence", ""),
+                    "status": "open",
+                    "pnl": 0,
+                })
+            elif "crypto_arb_cycle" in line:
+                latest_cycle = _parse_structlog(line)
+            elif "paper_resolved" in line:
+                parts = _parse_structlog(line)
+                for t in trades:
+                    if parts.get("market", "") in t.get("question", ""):
+                        t["status"] = parts.get("status", "open")
+                        t["pnl"] = float(parts.get("pnl", "0").replace("$", "").replace("+", ""))
+                        break
+
+        # Extract prices from latest cycle
+        prices = {}
+        price_str = latest_cycle.get("prices", "")
+        for chunk in price_str.split("|"):
+            chunk = chunk.strip()
+            if "=" in chunk:
+                sym, _, val = chunk.partition("=")
+                try:
+                    prices[sym.strip()] = float(val.strip().replace("$", "").replace(",", ""))
+                except ValueError:
+                    pass
+
+        bankroll = latest_cycle.get("bankroll", "")
+        open_pos = int(latest_cycle.get("open_positions", 0))
+        markets_scanned = int(latest_cycle.get("markets", 0))
+
+        # Compute totals
+        won = sum(1 for t in trades if t["status"] == "won")
+        lost = sum(1 for t in trades if t["status"] == "lost")
+        closed = won + lost
+        total_pnl = sum(t["pnl"] for t in trades if t["status"] != "open")
+        total_invested = sum(t["size_usd"] for t in trades)
+
+        result.update({
+            "bankroll": bankroll,
+            "total_pnl": f"${total_pnl:+.2f}",
+            "total_pnl_num": total_pnl,
+            "win_rate": f"{won/closed*100:.0f}%" if closed > 0 else "--",
+            "roi": f"{(total_pnl/total_invested*100):+.1f}%" if total_invested > 0 else "--",
+            "total_trades": len(trades),
+            "open": open_pos,
+            "won": won,
+            "lost": lost,
+            "trades": trades,
+            "prices": prices,
+            "markets_scanned": markets_scanned,
+        })
+    except Exception as e:
+        logger.warning("crypto_arb_status_parse_error", error=str(e))
+
+    return result
+
+
+@app.get("/api/ai-monitor")
+async def ai_monitor_status():
+    """Read the latest AI monitor verdict."""
+    import pathlib
+    log_path = pathlib.Path(__file__).parent.parent / "data" / "ai_monitor.log"
+    result = {"status": "none", "summary": "", "issues": "", "timestamp": ""}
+    if not log_path.exists():
+        return result
+    try:
+        text = log_path.read_text().strip()
+        # Parse the last verdict block (between ── separators)
+        blocks = text.split("──────────────────────────────────────────")
+        if len(blocks) >= 2:
+            last_block = blocks[-1].strip()
+            for line in last_block.split("\n"):
+                line = line.strip()
+                if line.startswith("[") and line.endswith("]"):
+                    result["timestamp"] = line.strip("[]")
+                elif line.startswith("STATUS:"):
+                    result["status"] = line.split(":", 1)[1].strip()
+                elif line.startswith("SUMMARY:"):
+                    result["summary"] = line.split(":", 1)[1].strip()
+                elif line.startswith("ISSUES:"):
+                    result["issues"] = line.split(":", 1)[1].strip()
+    except Exception as e:
+        logger.warning("ai_monitor_parse_error", error=str(e))
+    return result
 
 
 # --- Admin ---

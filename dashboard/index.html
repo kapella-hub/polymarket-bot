@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Polymarket Bot</title>
+<style>
+  :root {
+    --bg: #0a0e14; --surface: #10151d; --surface-2: #151c27;
+    --border: #1a2332; --border-hover: #263344;
+    --text: #b0bfd0; --text-dim: #556680; --text-bright: #e4ecf5;
+    --green: #34d399; --green-dim: rgba(52,211,153,0.10);
+    --red: #f87171; --red-dim: rgba(248,113,113,0.10);
+    --blue: #60a5fa; --blue-dim: rgba(96,165,250,0.10);
+    --amber: #fbbf24; --amber-dim: rgba(251,191,36,0.10);
+    --purple: #a78bfa; --purple-dim: rgba(167,139,250,0.10);
+    --cyan: #22d3ee; --cyan-dim: rgba(34,211,238,0.10);
+    --radius: 14px; --radius-sm: 8px;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Inter', system-ui, sans-serif;
+    background: var(--bg); color: var(--text);
+    padding: 20px; -webkit-font-smoothing: antialiased;
+    min-height: 100vh; max-width: 1080px; margin: 0 auto;
+  }
+
+  .header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 8px 0 24px;
+  }
+  .header-left { display: flex; align-items: center; gap: 12px; }
+  .logo {
+    width: 36px; height: 36px; border-radius: 10px;
+    background: linear-gradient(135deg, #a78bfa 0%, #22d3ee 100%);
+    display: grid; place-items: center;
+    font-size: 16px; font-weight: 800; color: #fff;
+  }
+  .header h1 { font-size: 1.15em; font-weight: 700; color: var(--text-bright); letter-spacing: -0.03em; }
+  .header-right { display: flex; align-items: center; gap: 10px; }
+  .status-dot {
+    width: 7px; height: 7px; border-radius: 50%; background: var(--green);
+    animation: blink 2.5s ease-in-out infinite;
+  }
+  .status-dot.error { background: var(--red); animation: none; }
+  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.25} }
+  .mode-pill {
+    font-size: 0.62em; font-weight: 700; letter-spacing: 0.1em;
+    padding: 4px 12px; border-radius: 20px; text-transform: uppercase;
+  }
+  .mode-live { background: var(--red-dim); color: var(--red); }
+  .mode-shadow { background: var(--amber-dim); color: var(--amber); }
+  .mode-paper { background: var(--blue-dim); color: var(--blue); }
+
+  .hero { text-align: center; padding: 20px 0 28px; }
+  .hero-value { font-size: 2.6em; font-weight: 800; color: var(--text-bright); letter-spacing: -0.04em; }
+  .hero-sub { display: flex; justify-content: center; gap: 24px; margin-top: 12px; font-size: 0.82em; flex-wrap: wrap; }
+  .hero-sub span { color: var(--text-dim); }
+  .hero-sub strong { font-weight: 600; }
+  .hero-sub .pos { color: var(--green); }
+  .hero-sub .neg { color: var(--red); }
+
+  .section-title {
+    font-size: 0.68em; font-weight: 600; color: var(--text-dim);
+    text-transform: uppercase; letter-spacing: 0.1em;
+    margin-bottom: 10px; padding-left: 2px;
+  }
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 18px;
+    transition: border-color 0.15s; margin-bottom: 14px;
+  }
+  .card:hover { border-color: var(--border-hover); }
+
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 24px; }
+  .grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 14px; margin-bottom: 24px; }
+
+  .kv { display: flex; justify-content: space-between; align-items: center; padding: 7px 0; }
+  .kv + .kv { border-top: 1px solid var(--border); }
+  .kv-label { color: var(--text-dim); font-size: 0.82em; }
+  .kv-val { font-weight: 600; font-size: 0.85em; color: var(--text-bright); }
+
+  .stat-card { text-align: center; }
+  .stat-num { font-size: 1.8em; font-weight: 800; color: var(--text-bright); letter-spacing: -0.03em; }
+  .stat-label { font-size: 0.72em; color: var(--text-dim); margin-top: 4px; text-transform: uppercase; letter-spacing: 0.05em; }
+
+  /* Prices bar */
+  .prices-bar {
+    display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 24px;
+  }
+  .price-chip {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 14px; border-radius: var(--radius-sm);
+    background: var(--surface); border: 1px solid var(--border);
+    font-size: 0.82em;
+  }
+  .price-sym { font-weight: 700; color: var(--text-bright); }
+  .price-val { color: var(--text); }
+
+  /* Positions/trades */
+  .pos-item {
+    display: grid; grid-template-columns: auto 1fr auto;
+    gap: 10px 14px; align-items: center;
+    padding: 12px 18px;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); margin-bottom: 8px;
+  }
+  .pos-item:hover { border-color: var(--border-hover); }
+  .pos-icon {
+    width: 36px; height: 36px; border-radius: 10px;
+    display: grid; place-items: center;
+    font-size: 0.65em; font-weight: 800; color: #fff;
+  }
+  .pos-mid { min-width: 0; }
+  .pos-name { font-weight: 700; font-size: 0.88em; color: var(--text-bright); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .pos-detail { font-size: 0.75em; color: var(--text-dim); margin-top: 2px; }
+  .pos-right { text-align: right; }
+  .pos-value { font-weight: 700; font-size: 0.92em; }
+  .pos-sub { font-size: 0.75em; color: var(--text-dim); margin-top: 2px; }
+
+  .side-pill {
+    display: inline-block; padding: 3px 10px; border-radius: 6px;
+    font-size: 0.7em; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase;
+  }
+  .side-buy { background: var(--green-dim); color: var(--green); }
+  .side-sell { background: var(--red-dim); color: var(--red); }
+  .side-won { background: var(--green-dim); color: var(--green); }
+  .side-lost { background: var(--red-dim); color: var(--red); }
+  .side-open { background: var(--blue-dim); color: var(--blue); }
+
+  /* AI monitor */
+  .ai-card { padding: 16px 18px; margin-bottom: 24px; }
+  .ai-card.ai-ok { border-color: rgba(52,211,153,0.25); }
+  .ai-card.ai-warning { border-color: rgba(251,191,36,0.3); background: var(--amber-dim); }
+  .ai-card.ai-critical { border-color: rgba(248,113,113,0.3); background: var(--red-dim); }
+  .ai-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+  .ai-badge {
+    font-size: 0.65em; font-weight: 700; letter-spacing: 0.08em;
+    padding: 3px 10px; border-radius: 12px; text-transform: uppercase;
+  }
+  .ai-ok .ai-badge { background: var(--green-dim); color: var(--green); }
+  .ai-warning .ai-badge { background: var(--amber-dim); color: var(--amber); }
+  .ai-critical .ai-badge { background: var(--red-dim); color: var(--red); }
+  .ai-summary { font-size: 0.82em; color: var(--text); line-height: 1.5; }
+  .ai-time { font-size: 0.7em; color: var(--text-dim); }
+
+  /* Markets table */
+  .market-row {
+    display: grid; grid-template-columns: 1fr auto auto auto;
+    gap: 12px; align-items: center; padding: 10px 0;
+    font-size: 0.82em;
+  }
+  .market-row + .market-row { border-top: 1px solid var(--border); }
+  .market-q { font-weight: 600; color: var(--text-bright); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .market-bid { color: var(--green); font-weight: 600; }
+  .market-ask { color: var(--red); font-weight: 600; }
+  .market-vol { color: var(--text-dim); }
+
+  .kill-banner {
+    display: flex; align-items: center; gap: 10px;
+    padding: 12px 16px; border-radius: var(--radius-sm);
+    margin-bottom: 20px; font-size: 0.82em; font-weight: 600;
+    background: var(--red-dim); color: var(--red); border: 1px solid rgba(248,113,113,0.2);
+  }
+
+  .footer {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 16px 0 8px; font-size: 0.68em; color: var(--text-dim);
+  }
+
+  .empty-state { text-align: center; padding: 32px; color: var(--text-dim); font-size: 0.85em; }
+
+  @media (max-width: 640px) {
+    body { padding: 14px; }
+    .hero-value { font-size: 2em; }
+    .grid-2, .grid-3 { grid-template-columns: 1fr; }
+    .market-row { grid-template-columns: 1fr auto; }
+    .market-vol, .market-ask { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-left">
+    <div class="logo">P</div>
+    <h1>Polymarket Bot</h1>
+  </div>
+  <div class="header-right">
+    <div id="dot" class="status-dot"></div>
+    <div id="mode"></div>
+  </div>
+</div>
+
+<div id="kill-banner"></div>
+<div id="app"><div class="empty-state">Connecting...</div></div>
+
+<div class="footer">
+  <span id="updated">--</span>
+  <span>Polymarket Latency Arb + Signal Engine</span>
+</div>
+
+<script>
+const API = window.location.origin;
+let arbData = null;
+let botData = null;
+let aiData = null;
+
+const usd = (n,d=2) => '$' + Number(n||0).toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d});
+const pct = (n,d=1) => (Number(n||0)*100).toFixed(d)+'%';
+const compact = n => { n=Number(n||0); if(n>=1e6) return '$'+(n/1e6).toFixed(1)+'M'; if(n>=1e3) return '$'+(n/1e3).toFixed(0)+'k'; return '$'+n.toFixed(0); };
+const ago = ts => { if(!ts) return '--'; const s=Math.floor((Date.now()-new Date(ts))/1000); if(s<60) return s+'s ago'; if(s<3600) return Math.floor(s/60)+'m ago'; return Math.floor(s/3600)+'h ago'; };
+
+async function refresh() {
+  try {
+    const [bRes, aRes, mRes] = await Promise.allSettled([
+      fetch(API+'/status').then(r=>r.json()),
+      fetch(API+'/api/crypto-arb').then(r=>r.json()).catch(()=>null),
+      fetch(API+'/api/ai-monitor').then(r=>r.json()).catch(()=>null),
+    ]);
+    botData = bRes.status==='fulfilled' ? bRes.value : botData;
+    arbData = aRes.status==='fulfilled' ? aRes.value : arbData;
+    aiData = mRes.status==='fulfilled' ? mRes.value : aiData;
+    render();
+    document.getElementById('dot').className = 'status-dot';
+  } catch(e) {
+    document.getElementById('dot').className = 'status-dot error';
+  }
+  document.getElementById('updated').textContent = 'Updated ' + new Date().toLocaleTimeString();
+}
+
+function render() {
+  const d = botData;
+  if(!d) return;
+
+  // Mode pill
+  const m = d.mode||'shadow';
+  document.getElementById('mode').className = 'mode-pill mode-'+m;
+  document.getElementById('mode').textContent = m;
+
+  // Kill switch
+  const kb = document.getElementById('kill-banner');
+  kb.innerHTML = d.kill_switch ? '<div class="kill-banner">KILL SWITCH ACTIVE — Trading halted</div>' : '';
+
+  // Crypto prices
+  const prices = arbData?.prices || {};
+  const priceHtml = Object.entries(prices).map(([sym,p]) =>
+    `<div class="price-chip"><span class="price-sym">${sym}</span><span class="price-val">${sym==='DOGE'||sym==='XRP'?usd(p,3):usd(p,2)}</span></div>`
+  ).join('');
+
+  // Arb stats
+  const arb = arbData || {};
+  const arbTradesHtml = (arb.trades||[]).slice(0,8).map(t => {
+    const statusCls = t.status==='won'?'side-won':t.status==='lost'?'side-lost':'side-open';
+    const bgColor = t.side==='buy_yes' ? '#059669' : '#7c3aed';
+    const edge = ((1/t.entry_price - 1)*100).toFixed(0);
+    return `<div class="pos-item">
+      <div class="pos-icon" style="background:${bgColor}">${t.asset||'?'}</div>
+      <div class="pos-mid">
+        <div class="pos-name">${(t.question||'').substring(0,55)}</div>
+        <div class="pos-detail">${t.side} @ ${usd(t.entry_price,4)} &middot; ${edge}% edge</div>
+      </div>
+      <div class="pos-right">
+        <div class="pos-value ${t.pnl>0?'pos':'neg'}" style="color:${t.pnl>0?'var(--green)':t.pnl<0?'var(--red)':'var(--text)'}">
+          ${t.status==='open'?usd(t.size_usd):(t.pnl>=0?'+':'')+usd(t.pnl)}
+        </div>
+        <div class="pos-sub"><span class="side-pill ${statusCls}">${t.status}</span></div>
+      </div>
+    </div>`;
+  }).join('') || '<div class="empty-state">No trades yet</div>';
+
+  // Signal markets
+  const mkts = (d.top_markets||[]).slice(0,8).map(m =>
+    `<div class="market-row">
+      <div class="market-q">${(m.question||'').substring(0,50)}</div>
+      <div class="market-bid">${m.best_bid!=null?usd(m.best_bid,3):'--'}</div>
+      <div class="market-ask">${m.best_ask!=null?usd(m.best_ask,3):'--'}</div>
+      <div class="market-vol">${compact(m.volume)}</div>
+    </div>`
+  ).join('');
+
+  // Positions
+  const posHtml = (d.positions||[]).map(p =>
+    `<div class="pos-item">
+      <div class="pos-icon" style="background:linear-gradient(135deg,#60a5fa,#a78bfa)">${p.outcome?.charAt(0)||'?'}</div>
+      <div class="pos-mid">
+        <div class="pos-name">${p.market_id?.substring(0,20)}...</div>
+        <div class="pos-detail">Avg entry: ${usd(p.avg_entry)} &middot; Size: ${p.size?.toFixed(2)}</div>
+      </div>
+      <div class="pos-right">
+        <div class="pos-value" style="color:${(p.unrealized_pnl||0)>=0?'var(--green)':'var(--red)'}">
+          ${usd(p.unrealized_pnl||0)}
+        </div>
+        <div class="pos-sub">P&L</div>
+      </div>
+    </div>`
+  ).join('') || '';
+
+  // Build
+  document.getElementById('app').innerHTML = `
+    ${priceHtml ? `<div class="prices-bar">${priceHtml}</div>` : ''}
+
+    <div class="grid-3">
+      <div class="card stat-card">
+        <div class="stat-num">${d.active_markets||0}</div>
+        <div class="stat-label">Markets</div>
+      </div>
+      <div class="card stat-card">
+        <div class="stat-num">${d.fresh_signals||0}</div>
+        <div class="stat-label">Fresh Signals</div>
+      </div>
+      <div class="card stat-card">
+        <div class="stat-num" style="color:${(arb.total_pnl_num||0)>=0?'var(--green)':'var(--red)'}">
+          ${arb.total_pnl||'$0.00'}
+        </div>
+        <div class="stat-label">Arb P&L</div>
+      </div>
+    </div>
+
+    ${arb.bankroll ? `
+    <div class="section-title">Crypto Latency Arbitrage</div>
+    <div class="grid-2">
+      <div class="card">
+        <div class="kv"><span class="kv-label">Bankroll</span><span class="kv-val">${arb.bankroll}</span></div>
+        <div class="kv"><span class="kv-label">ROI</span><span class="kv-val" style="color:${arb.roi?.startsWith('+') || arb.roi?.startsWith('0')?'var(--green)':'var(--red)'}">${arb.roi||'--'}</span></div>
+        <div class="kv"><span class="kv-label">Win Rate</span><span class="kv-val">${arb.win_rate||'--'}</span></div>
+      </div>
+      <div class="card">
+        <div class="kv"><span class="kv-label">Total Trades</span><span class="kv-val">${arb.total_trades||0}</span></div>
+        <div class="kv"><span class="kv-label">Open</span><span class="kv-val">${arb.open||0}</span></div>
+        <div class="kv"><span class="kv-label">Won / Lost</span><span class="kv-val"><span style="color:var(--green)">${arb.won||0}</span> / <span style="color:var(--red)">${arb.lost||0}</span></span></div>
+        <div class="kv"><span class="kv-label">Markets Scanned</span><span class="kv-val">${arb.markets_scanned||'--'}</span></div>
+      </div>
+    </div>
+    ` : ''}
+
+    <div class="section-title">Arb Trades</div>
+    ${arbTradesHtml}
+
+    ${posHtml ? `
+    <div class="section-title" style="margin-top:24px">Signal Positions</div>
+    ${posHtml}
+    ` : ''}
+
+    ${aiData && aiData.status !== 'none' ? `
+    <div class="section-title" style="margin-top:24px">AI Monitor</div>
+    <div class="card ai-card ai-${(aiData.status||'unknown').toLowerCase()}">
+      <div class="ai-header">
+        <span style="font-weight:700;font-size:0.85em;color:var(--text-bright)">Health Check</span>
+        <span class="ai-badge">${aiData.status||'UNKNOWN'}</span>
+      </div>
+      <div class="ai-summary">${aiData.summary||'No verdict available'}</div>
+      ${aiData.issues && aiData.issues !== 'NONE' ? `<div style="font-size:0.75em;color:var(--amber);margin-top:6px">${aiData.issues}</div>` : ''}
+      <div class="ai-time">${aiData.timestamp||''}</div>
+    </div>
+    ` : ''}
+
+    <div class="section-title" style="margin-top:24px">Top Markets</div>
+    <div class="card" style="padding:12px 18px">
+      <div class="market-row" style="font-weight:700;color:var(--text-dim);font-size:0.72em;text-transform:uppercase;letter-spacing:0.05em;border:none;padding-bottom:4px">
+        <div>Market</div><div>Bid</div><div>Ask</div><div>Volume</div>
+      </div>
+      ${mkts || '<div class="empty-state">No markets</div>'}
+    </div>
+  `;
+}
+
+setInterval(refresh, 5000);
+refresh();
+</script>
+</body>
+</html>
