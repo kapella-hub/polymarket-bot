@@ -110,8 +110,8 @@ class SniperTrader:
                 return False
 
         token_id = signal.token_id
-        # Use the lower of our snipe price or the signal's entry price
-        limit_price = min(self.snipe_price, signal.entry_price + 0.03)
+        # Use fixed snipe price — the Gamma entry_price is stale/wrong
+        limit_price = self.snipe_price
 
         try:
             tokens_to_buy = size / limit_price

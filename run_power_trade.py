@@ -283,12 +283,20 @@ async def run_cycle(clob, state, max_trades=3):
     if not candidates:
         return
 
-    # Analyze more candidates — mix high-volume with novelty/meme markets
-    # High-volume are well-priced (sports). The edge is in weird/novelty markets.
-    top_by_volume = candidates[:5]
-    novelty = [c for c in candidates[5:] if c["yes_price"] > 0.20 and c["yes_price"] < 0.80][:10]
-    mid_range = [c for c in candidates if 0.30 < c["yes_price"] < 0.70][:5]
-    to_analyze = list({c["id"]: c for c in top_by_volume + novelty + mid_range}.values())[:20]
+    # Prioritize novelty/meme markets OVER sports — that's where mispricing lives
+    # Sports are well-arbitraged by sportsbooks. Novelty/politics are not.
+    sports_keywords = {"nba", "nhl", "nfl", "mlb", "premier league", "champions league",
+                       "fifa", "world cup", "mvp", "win the 2025", "win the 2026"}
+    sports = []
+    non_sports = []
+    for c in candidates:
+        q_lower = c["question"].lower()
+        if any(kw in q_lower for kw in sports_keywords):
+            sports.append(c)
+        else:
+            non_sports.append(c)
+    # Non-sports first (more likely mispriced), then a few sports for diversity
+    to_analyze = non_sports[:15] + sports[:5]
     trades_placed = 0
     open_ids = {t["market_id"] for t in state["trades"] if t["status"] == "open"}
 
