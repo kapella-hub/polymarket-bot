@@ -124,7 +124,7 @@ async def fetch_candidate_markets() -> list:
                 except (ValueError, TypeError):
                     continue
                 days_to_end = (end_date - now).total_seconds() / 86400
-                if days_to_end < 0.5 or days_to_end > 30:
+                if days_to_end < 0 or days_to_end > 180:
                     continue
 
                 tokens = m.get("clobTokenIds", [])
