@@ -371,15 +371,19 @@ async def crypto_arb_status():
     """Read the latest crypto arb paper trading state from the log file."""
     import json as jsonmod
     import pathlib
-    # Prefer WS engine log, fall back to REST engine log
+    # Priority: live v4 > WS engine > REST engine
+    live_log = pathlib.Path(__file__).parent.parent / "live_arb_output.log"
     ws_log = pathlib.Path(__file__).parent.parent / "fast_arb_ws_output.log"
     rest_log = pathlib.Path(__file__).parent.parent / "crypto_arb_output.log"
-    log_path = ws_log if ws_log.exists() and ws_log.stat().st_size > 0 else rest_log
+    log_path = live_log if live_log.exists() and live_log.stat().st_size > 0 else (
+        ws_log if ws_log.exists() and ws_log.stat().st_size > 0 else rest_log
+    )
     result = {
         "bankroll": None, "total_pnl": "$0.00", "total_pnl_num": 0,
         "win_rate": "--", "roi": "--", "total_trades": 0,
         "open": 0, "won": 0, "lost": 0, "trades": [], "prices": {},
-        "markets_scanned": 0,
+        "markets_scanned": 0, "signals": 0, "skip_repriced": 0,
+        "ticks": 0, "period_remaining": "", "version": "legacy",
     }
     if not log_path.exists():
         return result
@@ -425,6 +429,34 @@ async def crypto_arb_status():
                         t["status"] = status
                         t["pnl"] = pnl
                         break
+            elif "LIVE_FILL" in line:
+                parts = _parse_structlog(line)
+                trades.append({
+                    "question": f"{parts.get('coin', '?')} 15-min {parts.get('side', '')}",
+                    "side": parts.get("side", ""),
+                    "entry_price": float(parts.get("clob_ask", "0").replace("$", "")),
+                    "size_usd": float(parts.get("size", "0").replace("$", "")),
+                    "asset": parts.get("coin", "?"),
+                    "binance_at_entry": 0,
+                    "edge": parts.get("move", ""),
+                    "confidence": parts.get("conf", ""),
+                    "status": "open",
+                    "pnl": 0,
+                })
+            elif "LIVE_RESOLVED" in line:
+                parts = _parse_structlog(line)
+                coin = parts.get("coin", "")
+                pnl_val = float(parts.get("pnl", "0").replace("$", "").replace("+", ""))
+                status = "won" if pnl_val > 0 else "lost"
+                for t in reversed(trades):
+                    if t.get("asset") == coin and t["status"] == "open":
+                        t["status"] = status
+                        t["pnl"] = pnl_val
+                        break
+            elif "v4_cycle" in line:
+                latest_cycle = _parse_structlog(line)
+            elif "v4_new_period" in line:
+                latest_cycle.update(_parse_structlog(line))
             elif "fast_cycle" in line:
                 latest_cycle = _parse_structlog(line)
             elif "paper_trade" in line:
@@ -481,6 +513,11 @@ async def crypto_arb_status():
         total_pnl = sum(t["pnl"] for t in trades if t["status"] != "open")
         total_invested = sum(t["size_usd"] for t in trades)
 
+        # Detect v4 engine
+        is_v4 = "v4_cycle" in str(latest_cycle) or any(
+            k in latest_cycle for k in ("signals", "ticks", "period_remaining")
+        )
+
         result.update({
             "bankroll": bankroll,
             "total_pnl": f"${total_pnl:+.2f}",
@@ -494,6 +531,11 @@ async def crypto_arb_status():
             "trades": trades,
             "prices": prices,
             "markets_scanned": markets_scanned,
+            "signals": int(latest_cycle.get("signals", 0)),
+            "skip_repriced": int(latest_cycle.get("skip_repriced", 0)),
+            "ticks": int(latest_cycle.get("ticks", 0)),
+            "period_remaining": latest_cycle.get("period_remaining", ""),
+            "version": "v4" if is_v4 else "legacy",
         })
     except Exception as e:
         logger.warning("crypto_arb_status_parse_error", error=str(e))
