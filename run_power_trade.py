@@ -274,7 +274,7 @@ async def execute_trade(clob, market, side, size_usd, state) -> bool:
         return False
 
 
-async def run_cycle(clob, state, max_trades=2):
+async def run_cycle(clob, state, max_trades=3):
     logger.info("power_cycle_start", bankroll=f"${state['bankroll']:.2f}")
 
     candidates = await fetch_candidate_markets()
@@ -283,7 +283,12 @@ async def run_cycle(clob, state, max_trades=2):
     if not candidates:
         return
 
-    to_analyze = candidates[:8]
+    # Analyze more candidates — mix high-volume with novelty/meme markets
+    # High-volume are well-priced (sports). The edge is in weird/novelty markets.
+    top_by_volume = candidates[:5]
+    novelty = [c for c in candidates[5:] if c["yes_price"] > 0.20 and c["yes_price"] < 0.80][:10]
+    mid_range = [c for c in candidates if 0.30 < c["yes_price"] < 0.70][:5]
+    to_analyze = list({c["id"]: c for c in top_by_volume + novelty + mid_range}.values())[:20]
     trades_placed = 0
     open_ids = {t["market_id"] for t in state["trades"] if t["status"] == "open"}
 
@@ -318,12 +323,12 @@ async def run_cycle(clob, state, max_trades=2):
             why=reasoning[:80],
         )
 
-        if confidence < 0.70:
+        if confidence < 0.60:
             continue
 
-        if edge_yes > 0.08:
+        if edge_yes > 0.06:
             side, edge = "buy_yes", edge_yes
-        elif edge_no > 0.08:
+        elif edge_no > 0.06:
             side, edge = "buy_no", edge_no
         else:
             continue

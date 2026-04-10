@@ -77,8 +77,8 @@ class SniperTrader:
         bankroll: float = 300.0,
         bet_fraction: float = 0.08,
         max_concurrent: int = 3,
-        snipe_price: float = 0.55,       # Fixed price for blind limit orders
-        cancel_after_s: float = 15.0,    # Cancel unfilled orders after this
+        snipe_price: float = 0.62,       # Fixed price for blind limit orders
+        cancel_after_s: float = 10.0,    # Cancel unfilled orders after this
     ):
         self.clob = clob
         self.bankroll = bankroll
@@ -303,7 +303,7 @@ async def main():
     duration = int(sys.argv[1]) if len(sys.argv) > 1 else 43200
     bankroll = float(sys.argv[2]) if len(sys.argv) > 2 else 300.0
     bet_pct = float(sys.argv[3]) if len(sys.argv) > 3 else 0.08
-    snipe_price = float(sys.argv[4]) if len(sys.argv) > 4 else 0.55
+    snipe_price = float(sys.argv[4]) if len(sys.argv) > 4 else 0.62
 
     clob = create_clob()
     scanner = FastMarketScanner()
