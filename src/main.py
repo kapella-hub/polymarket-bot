@@ -543,6 +543,123 @@ async def crypto_arb_status():
     return result
 
 
+@app.get("/api/all-status")
+async def all_status():
+    """Unified status endpoint for dashboard — reads all bot logs and state files."""
+    import json as jsonmod
+    import pathlib
+    import re as _re
+
+    base = pathlib.Path(__file__).parent.parent
+    result = {
+        "contrarian": {"bankroll": 0, "pnl": 0, "trades": 0, "wins": 0, "losses": 0,
+                        "win_rate": "--", "open": 0, "btc": 0, "pending": False,
+                        "period_elapsed": "", "signals": []},
+        "power_trader": {"bankroll": 0, "positions": [], "total_invested": 0},
+        "wallet_usdc": 0,
+        "ai_monitor": {"status": "none", "summary": "", "issues": "", "timestamp": ""},
+    }
+
+    def _parse(line):
+        parts = {}
+        for m in _re.finditer(r"(\w+)='([^']*)'|(\w+)=(\S+)", line):
+            if m.group(1):
+                parts[m.group(1)] = m.group(2)
+            elif m.group(3):
+                parts[m.group(3)] = m.group(4)
+        return parts
+
+    # --- Contrarian bot ---
+    clog = base / "contrarian_output.log"
+    if clog.exists():
+        try:
+            lines = clog.read_text().strip().split("\n")
+            trades = []
+            signals = []
+            latest = {}
+            for line in lines:
+                if "contrarian_status" in line:
+                    latest = _parse(line)
+                elif "CONTRARIAN_TRADE" in line:
+                    trades.append(_parse(line))
+                elif "CONTRARIAN_RESOLVED" in line:
+                    p = _parse(line)
+                    trades.append(p)
+                elif "CONTRARIAN_SIGNAL" in line:
+                    signals.append(_parse(line))
+
+            bankroll = float(latest.get("bankroll", "0").replace("$", ""))
+            pnl = float(latest.get("pnl", "0").replace("$", "").replace("+", ""))
+            btc = float(latest.get("btc", "0"))
+            tr = latest.get("trades", "0W/0L")
+            wins = int(tr.split("W")[0]) if "W" in tr else 0
+            losses = int(tr.split("/")[1].replace("L", "")) if "/" in tr else 0
+
+            result["contrarian"] = {
+                "bankroll": bankroll,
+                "pnl": pnl,
+                "trades": wins + losses,
+                "wins": wins,
+                "losses": losses,
+                "win_rate": latest.get("win_rate", "--"),
+                "open": int(latest.get("open", "0")),
+                "btc": btc,
+                "pending": latest.get("pending", "no") != "no",
+                "period_elapsed": latest.get("period_elapsed", ""),
+                "recent_trades": trades[-10:],
+                "recent_signals": signals[-5:],
+            }
+        except Exception:
+            pass
+
+    # --- Power trader ---
+    pt_state = base / "data" / "power_trade_state.json"
+    if pt_state.exists():
+        try:
+            state = jsonmod.loads(pt_state.read_text())
+            positions = []
+            for t in state.get("trades", []):
+                if t.get("status") == "open":
+                    positions.append({
+                        "question": t.get("question", "")[:50],
+                        "side": t.get("side", ""),
+                        "price": t.get("price", 0),
+                        "size": t.get("size_usd", 0),
+                        "tokens": t.get("tokens", 0),
+                        "entry_time": t.get("entry_time", ""),
+                    })
+            result["power_trader"] = {
+                "bankroll": state.get("bankroll", 0),
+                "positions": positions,
+                "total_invested": state.get("total_invested", 0),
+            }
+        except Exception:
+            pass
+
+    # --- AI monitor ---
+    ai_log = base / "data" / "ai_monitor.log"
+    if ai_log.exists():
+        try:
+            text = ai_log.read_text().strip()
+            blocks = text.split("──────────────────────────────────────────")
+            if len(blocks) >= 2:
+                last = blocks[-1].strip()
+                for line in last.split("\n"):
+                    line = line.strip()
+                    if line.startswith("[") and line.endswith("]"):
+                        result["ai_monitor"]["timestamp"] = line.strip("[]")
+                    elif line.startswith("STATUS:"):
+                        result["ai_monitor"]["status"] = line.split(":", 1)[1].strip()
+                    elif line.startswith("SUMMARY:"):
+                        result["ai_monitor"]["summary"] = line.split(":", 1)[1].strip()
+                    elif line.startswith("ISSUES:"):
+                        result["ai_monitor"]["issues"] = line.split(":", 1)[1].strip()
+        except Exception:
+            pass
+
+    return result
+
+
 @app.get("/api/ai-monitor")
 async def ai_monitor_status():
     """Read the latest AI monitor verdict."""
