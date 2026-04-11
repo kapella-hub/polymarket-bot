@@ -104,6 +104,23 @@ class FastMarketScanner:
 
         return markets
 
+    async def fetch_btc(self, period_ts: int) -> Optional[FastMarket]:
+        """Fetch only the BTC market for a given period — no rate-limit sleeps."""
+        slug = f"btc-updown-15m-{period_ts}"
+        try:
+            resp = await self._client.get(
+                f"https://gamma-api.polymarket.com/markets?slug={slug}"
+            )
+            data = resp.json()
+            if data:
+                parsed = self._parse(data[0], "btc", period_ts)
+                if parsed:
+                    self._current_markets["btc"] = parsed
+                return parsed
+        except Exception as e:
+            logger.debug("fast_btc_fetch_error", period=period_ts, error=str(e))
+        return None
+
     async def scan_next_period(self) -> list[FastMarket]:
         """Pre-fetch markets for the next 15-minute period."""
         ts = (int(time.time() // 900) + 1) * 900

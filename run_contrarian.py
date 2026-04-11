@@ -19,6 +19,7 @@ Pipeline:
 """
 
 import asyncio
+import functools
 import json
 import os
 import sys
@@ -106,6 +107,9 @@ async def main():
     last_status = 0
     pending_signal = None  # Signal to execute at next period start
     open_trades = {}  # condition_id -> trade
+    next_period_btc_market = None  # Pre-fetched market for next period
+    next_period_prefetched = False  # Whether we've tried to pre-fetch
+    loop = asyncio.get_event_loop()
 
     ws_feed = BinanceWSFeed()
     ws_task = asyncio.create_task(ws_feed.run())
@@ -132,8 +136,21 @@ async def main():
 
             btc = ws_feed.get("BTC")
             if not btc:
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.1)
                 continue
+
+            # Pre-fetch next period's BTC market 60s before boundary
+            next_period_ts = period_ts + 900
+            if remaining <= 60 and not next_period_prefetched:
+                next_period_prefetched = True
+                try:
+                    prefetched = await scanner.fetch_btc(next_period_ts)
+                    if prefetched:
+                        next_period_btc_market = prefetched
+                        logger.info("prefetched_next_period", period=next_period_ts,
+                                    up=prefetched.up_price, down=prefetched.down_price)
+                except Exception as e:
+                    logger.debug("prefetch_error", error=str(e))
 
             # NEW PERIOD START
             if period_ts != current_period:
@@ -141,18 +158,26 @@ async def main():
                 period_start_prices[period_ts] = btc
                 logger.info("period_start", period=period_ts, btc=btc)
 
+                # Prune stale period data — keep last 3 periods only
+                cutoff = period_ts - 3 * 900
+                for old_ts in [k for k in list(period_start_prices) if k < cutoff]:
+                    del period_start_prices[old_ts]
+                for old_ts in [k for k in list(period_end_prices) if k < cutoff]:
+                    del period_end_prices[old_ts]
+
+                # Reset pre-fetch flag for this new period
+                next_period_prefetched = False
+
                 # If we have a pending contrarian signal, EXECUTE NOW
                 if pending_signal:
                     direction = pending_signal["fade_direction"]
                     move_pct = pending_signal["trigger_move"]
 
-                    # Scan for next period's markets
-                    markets = await scanner.scan_current_period()
-                    btc_market = None
-                    for m in markets:
-                        if m.asset == "BTC":
-                            btc_market = m
-                            break
+                    # Use pre-fetched market or fetch now (single coin, no sleep)
+                    btc_market = next_period_btc_market
+                    next_period_btc_market = None
+                    if btc_market is None:
+                        btc_market = await scanner.fetch_btc(period_ts)
 
                     if btc_market:
                         # Buy the OPPOSITE side
@@ -173,8 +198,11 @@ async def main():
                                     size=round(tokens, 2),
                                     side=BUY,
                                 )
-                                signed = clob.create_order(order_args)
-                                result = clob.post_order(signed, OrderType.GTC)
+                                # Run sync CLOB calls in thread executor — don't block event loop
+                                signed = await loop.run_in_executor(None, clob.create_order, order_args)
+                                result = await loop.run_in_executor(
+                                    None, functools.partial(clob.post_order, signed, OrderType.GTC)
+                                )
                                 order_id = result.get("orderID", "")
 
                                 if order_id:
@@ -268,12 +296,14 @@ async def main():
                 t_start = period_start_prices.get(trade["period"])
                 t_end = period_end_prices.get(trade["period"])
 
-                if t_start and t_end:
-                    actual_move = (t_end - t_start) / t_start
-                    won = (trade["side"] == "buy_down" and actual_move < 0) or \
-                          (trade["side"] == "buy_up" and actual_move > 0)
-                else:
-                    won = True  # Assume win if we can't verify
+                if not t_start or not t_end:
+                    # No price data — skip; don't inflate bankroll with phantom wins
+                    logger.debug("resolution_skipped_no_data", cid=cid, period=trade["period"])
+                    continue
+
+                actual_move = (t_end - t_start) / t_start
+                won = (trade["side"] == "buy_down" and actual_move < 0) or \
+                      (trade["side"] == "buy_up" and actual_move > 0)
 
                 tokens = trade["tokens"]
                 if won:
@@ -320,7 +350,7 @@ async def main():
                 )
                 last_status = time.time()
 
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.1)
 
     except KeyboardInterrupt:
         print("\nStopping...")
