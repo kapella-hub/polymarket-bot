@@ -262,7 +262,8 @@ async def main():
 
     current_period     = 0
     hist_start: dict[int, dict[str, float]] = {}
-    open_trades: list[dict] = []
+    open_trades: list[dict] = [t for t in state.get("trades", [])
+                                if t.get("status") in ("placed", "pending_settlement")]
     fired_this_period: set[str] = set()
     last_skip_period = 0
     last_check_ts = 0
@@ -324,9 +325,108 @@ async def main():
                             circuit="skip%d" % skip_signals if skip_signals else "ok")
                 last_status = now_ts
 
-            # ── DAILY LOSS LIMIT ──────────────────────────────
+            # ── CANCEL UNFILLED ORDERS ────────────────────────
+            now_f = time.time()
+            for trade in list(open_trades):
+                if trade["status"] != "placed":
+                    continue
+                if now_f < trade.get("cancel_at", float("inf")):
+                    continue
+                cancelled = await cancel_order(loop, clob, trade["order_id"])
+                if cancelled:
+                    bankroll += trade["size_usd"]
+                    state["bankroll"] = bankroll
+                    trade["status"] = "cancelled"
+                    trade["pnl"]    = 0
+                    save_state(state)
+                    logger.info("CERTAINTY_CANCELLED",
+                                coin=trade["coin"].upper(),
+                                order_id=trade["order_id"][:16])
+                else:
+                    trade["cancel_at"] = now_f + 15
+
+            # ── RESOLVE TRADES (period_end + 120s grace) ──────
+            for trade in list(open_trades):
+                if trade["status"] != "placed":
+                    continue
+                if now_ts <= trade["period_end"] + 120:
+                    continue
+
+                coin  = trade["coin"]
+                asset = COIN_TO_ASSET[coin]
+                t_per = trade["period"]
+
+                start_p = hist_start.get(t_per, {}).get(asset)
+                end_p   = ws_feed.get(asset)
+
+                if not start_p:
+                    trade["status"] = "pending_settlement"
+                    continue
+
+                actual_move = ((end_p - start_p) / start_p) if end_p else 0
+                won = (
+                    (trade["side"] == "buy_up"   and actual_move > 0) or
+                    (trade["side"] == "buy_down"  and actual_move < 0)
+                )
+
+                if won:
+                    payout = trade["tokens"] * 0.98  # 2% Polymarket fee
+                    trade["pnl"]    = round(payout - trade["size_usd"], 2)
+                    trade["status"] = "won"
+                    bankroll += payout
+                    state["total_returned"] = state.get("total_returned", 0) + payout
+                    consecutive_losses = 0
+                else:
+                    trade["pnl"]    = -trade["size_usd"]
+                    trade["status"] = "lost"
+                    consecutive_losses += 1
+                    if consecutive_losses >= CIRCUIT_LOSSES:
+                        skip_signals = CIRCUIT_SKIP
+                        state["skip_signals"] = skip_signals
+                        logger.warning("CIRCUIT_BREAKER",
+                                       consecutive_losses=consecutive_losses,
+                                       skipping_next=CIRCUIT_SKIP)
+                        consecutive_losses = 0
+
+                state["bankroll"]            = bankroll
+                state["consecutive_losses"]  = consecutive_losses
+                save_state(state)
+
+                wins_total   = sum(1 for t in state["trades"] if t.get("status") == "won")
+                losses_total = sum(1 for t in state["trades"] if t.get("status") == "lost")
+                total_t      = wins_total + losses_total
+                wr           = ("%.0f%%" % (wins_total / total_t * 100)) if total_t else "--"
+
+                logger.info("CERTAINTY_RESOLVED",
+                            coin=coin.upper(),
+                            side=trade["side"],
+                            won=won,
+                            pnl=trade["pnl"],
+                            bankroll=round(bankroll, 2),
+                            win_rate=wr,
+                            trades="%dW/%dL" % (wins_total, losses_total))
+
+            # ── EXPIRE STUCK PENDING_SETTLEMENT TRADES ────────
+            for trade in list(open_trades):
+                if trade["status"] != "pending_settlement":
+                    continue
+                if now_ts <= trade["period_end"] + 300:
+                    continue
+                trade["status"] = "expired"
+                trade["pnl"]    = 0
+                bankroll += trade["size_usd"]
+                state["bankroll"] = bankroll
+                save_state(state)
+                logger.warning("certainty_expired",
+                               coin=trade["coin"].upper(),
+                               size_usd=trade["size_usd"],
+                               reason="no_start_price_after_300s")
+
+            # ── DAILY LOSS LIMIT (only blocks new trades) ─────
+            # Exclude deployed capital — a placed bet is not a loss yet
+            open_deployed = sum(t["size_usd"] for t in open_trades if t["status"] == "placed")
             daily_start = state.get("daily_start_bankroll", bankroll)
-            if daily_start > 0 and (daily_start - bankroll) / daily_start >= DAILY_LOSS_PCT:
+            if daily_start > 0 and (daily_start - (bankroll + open_deployed)) / daily_start >= DAILY_LOSS_PCT:
                 logger.warning("daily_loss_limit_hit",
                                start=round(daily_start, 2), now=round(bankroll, 2))
                 await asyncio.sleep(300)
@@ -445,102 +545,6 @@ async def main():
                                 bankroll=round(bankroll, 2),
                                 order_id=order_id[:16])
 
-            # ── CANCEL UNFILLED ORDERS ────────────────────────
-            now_f = time.time()
-            for trade in list(open_trades):
-                if trade["status"] != "placed":
-                    continue
-                if now_f < trade.get("cancel_at", float("inf")):
-                    continue
-                cancelled = await cancel_order(loop, clob, trade["order_id"])
-                if cancelled:
-                    bankroll += trade["size_usd"]
-                    state["bankroll"] = bankroll
-                    trade["status"] = "cancelled"
-                    trade["pnl"]    = 0
-                    save_state(state)
-                    logger.info("CERTAINTY_CANCELLED",
-                                coin=trade["coin"].upper(),
-                                order_id=trade["order_id"][:16])
-                else:
-                    trade["cancel_at"] = now_f + 15
-
-            # ── RESOLVE TRADES (period_end + 120s grace) ──────
-            for trade in list(open_trades):
-                if trade["status"] != "placed":
-                    continue
-                if now_ts <= trade["period_end"] + 120:
-                    continue
-
-                coin  = trade["coin"]
-                asset = COIN_TO_ASSET[coin]
-                t_per = trade["period"]
-
-                start_p = hist_start.get(t_per, {}).get(asset)
-                end_p   = ws_feed.get(asset)
-
-                if not start_p:
-                    trade["status"] = "pending_settlement"
-                    continue
-
-                actual_move = ((end_p - start_p) / start_p) if end_p else 0
-                won = (
-                    (trade["side"] == "buy_up"   and actual_move > 0) or
-                    (trade["side"] == "buy_down"  and actual_move < 0)
-                )
-
-                if won:
-                    payout = trade["tokens"] * 0.98  # 2% Polymarket fee
-                    trade["pnl"]    = round(payout - trade["size_usd"], 2)
-                    trade["status"] = "won"
-                    bankroll += payout
-                    state["total_returned"] = state.get("total_returned", 0) + payout
-                    consecutive_losses = 0
-                else:
-                    trade["pnl"]    = -trade["size_usd"]
-                    trade["status"] = "lost"
-                    consecutive_losses += 1
-                    if consecutive_losses >= CIRCUIT_LOSSES:
-                        skip_signals = CIRCUIT_SKIP
-                        state["skip_signals"] = skip_signals
-                        logger.warning("CIRCUIT_BREAKER",
-                                       consecutive_losses=consecutive_losses,
-                                       skipping_next=CIRCUIT_SKIP)
-                        consecutive_losses = 0
-
-                state["bankroll"]            = bankroll
-                state["consecutive_losses"]  = consecutive_losses
-                save_state(state)
-
-                wins_total   = sum(1 for t in state["trades"] if t.get("status") == "won")
-                losses_total = sum(1 for t in state["trades"] if t.get("status") == "lost")
-                total_t      = wins_total + losses_total
-                wr           = ("%.0f%%" % (wins_total / total_t * 100)) if total_t else "--"
-
-                logger.info("CERTAINTY_RESOLVED",
-                            coin=coin.upper(),
-                            side=trade["side"],
-                            won=won,
-                            pnl=trade["pnl"],
-                            bankroll=round(bankroll, 2),
-                            win_rate=wr,
-                            trades="%dW/%dL" % (wins_total, losses_total))
-
-            # ── EXPIRE STUCK PENDING_SETTLEMENT TRADES ────────
-            for trade in list(open_trades):
-                if trade["status"] != "pending_settlement":
-                    continue
-                if now_ts <= trade["period_end"] + 300:
-                    continue
-                trade["status"] = "expired"
-                trade["pnl"]    = 0
-                bankroll += trade["size_usd"]
-                state["bankroll"] = bankroll
-                save_state(state)
-                logger.warning("certainty_expired",
-                               coin=trade["coin"].upper(),
-                               size_usd=trade["size_usd"],
-                               reason="no_start_price_after_300s")
             open_trades = [t for t in open_trades
                            if t["status"] not in ("won", "lost", "cancelled", "expired")]
 
@@ -556,13 +560,11 @@ async def main():
 if __name__ == "__main__":
     import logging
     logging.basicConfig(
-        handlers=[
-            logging.FileHandler(LOG_FILE, mode='a'),
-            logging.StreamHandler(),
-        ],
+        handlers=[logging.StreamHandler()],
         format="%(message)s",
-        level=logging.DEBUG,
+        level=logging.INFO,
     )
+    logging.getLogger("websockets").setLevel(logging.WARNING)
     structlog.configure(
         processors=[
             structlog.stdlib.add_log_level,
