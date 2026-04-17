@@ -122,7 +122,10 @@ def create_clob() -> ClobClient:
 
 def load_state() -> dict:
     if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text())
+        try:
+            return json.loads(STATE_FILE.read_text())
+        except (json.JSONDecodeError, ValueError):
+            logger.warning("state_file_corrupt", path=str(STATE_FILE))
     return {
         "bankroll": 0.0,
         "trades": [],
@@ -148,6 +151,7 @@ async def gate3_orderbook(client: httpx.AsyncClient, coin: str, direction: str) 
             f"https://api.binance.com/api/v3/depth?symbol={symbol}&limit=10",
             timeout=3,
         )
+        resp.raise_for_status()
         data = resp.json()
         bid_vol = sum(float(qty) for _, qty in data.get("bids", []))
         ask_vol = sum(float(qty) for _, qty in data.get("asks", []))
