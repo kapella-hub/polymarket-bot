@@ -274,6 +274,7 @@ async def main():
     rolling_prices: dict[str, deque] = {a: deque() for a in COIN_TO_ASSET.values()}
     continuation_trades_this_period = 0
     last_continuation_period        = 0
+    last_cont_skip_log_key: tuple | None = None  # (period_ts, elapsed_bucket) dedup
 
     consecutive_losses = 0
     skip_signals       = 0
@@ -614,12 +615,16 @@ async def main():
                                                         entry=round(entry_price, 4),
                                                         size=actual_size)
 
-                # Log skip once per minute to avoid flooding
-                if skip_reason and elapsed % 60 == 0:
-                    logger.info("CONT_SKIP", reason=skip_reason,
-                                period=period_ts, elapsed=elapsed,
-                                btc_move=round(btc_move * 100, 3) if btc_move else None,
-                                eth_move=round(eth_move * 100, 3) if eth_move else None)
+                # Log skip once per minute bucket (dedup across 0.1s loop ticks)
+                if skip_reason:
+                    bucket = elapsed // 60
+                    cur_key = (period_ts, bucket)
+                    if cur_key != last_cont_skip_log_key:
+                        last_cont_skip_log_key = cur_key
+                        logger.info("CONT_SKIP", reason=skip_reason,
+                                    period=period_ts, elapsed=elapsed,
+                                    btc_move=round(btc_move * 100, 3) if btc_move else None,
+                                    eth_move=round(eth_move * 100, 3) if eth_move else None)
 
             # ──────────────────────────────────────────────────
             # RESOLVE trades (period_end + 120s grace)
