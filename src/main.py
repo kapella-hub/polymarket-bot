@@ -552,9 +552,12 @@ async def all_status():
 
     base = pathlib.Path(__file__).parent.parent
     result = {
-        "contrarian": {"bankroll": 0, "pnl": 0, "trades": 0, "wins": 0, "losses": 0,
-                        "win_rate": "--", "open": 0, "btc": 0, "pending": False,
-                        "period_elapsed": "", "signals": []},
+        "sniper": {"bankroll": 0, "pnl": 0, "trades": 0, "wins": 0, "losses": 0,
+                   "win_rate": "--", "open": 0, "btc": 0, "period_elapsed": "",
+                   "circuit": "ok", "recent_trades": [], "recent_resolved": []},
+        "certainty_sniper": {"bankroll": 0, "pnl": 0, "wins": 0, "losses": 0,
+                             "win_rate": "--", "open": 0, "btc": 0, "period_elapsed": "",
+                             "circuit": "ok", "recent_trades": [], "recent_resolved": []},
         "power_trader": {"bankroll": 0, "positions": [], "total_invested": 0},
         "wallet_usdc": 0,
         "ai_monitor": {"status": "none", "summary": "", "issues": "", "timestamp": ""},
@@ -569,24 +572,34 @@ async def all_status():
                 parts[m.group(3)] = m.group(4)
         return parts
 
-    # --- Contrarian bot ---
-    clog = base / "contrarian_output.log"
-    if clog.exists():
+    # --- Momentum Sniper bot ---
+    slog = base / "sniper_output.log"
+    if slog.exists():
         try:
-            lines = clog.read_text().strip().split("\n")
+            lines = slog.read_text().strip().split("\n")
             trades = []
-            signals = []
+            resolved = []
             latest = {}
-            for line in lines:
-                if "contrarian_status" in line:
+            skip_remaining = 0
+            cancelled_ids: set = set()
+            for line in lines[-1000:]:
+                if "sniper_status" in line:
                     latest = _parse(line)
-                elif "CONTRARIAN_TRADE" in line:
+                elif "SNIPER_TRADE" in line:
                     trades.append(_parse(line))
-                elif "CONTRARIAN_RESOLVED" in line:
+                elif "SNIPER_CANCELLED" in line:
                     p = _parse(line)
-                    trades.append(p)
-                elif "CONTRARIAN_SIGNAL" in line:
-                    signals.append(_parse(line))
+                    cancelled_ids.add(p.get("order_id", ""))
+                elif "SNIPER_RESOLVED" in line:
+                    resolved.append(_parse(line))
+                elif "CIRCUIT_BREAKER" in line and "TICK" not in line:
+                    p = _parse(line)
+                    skip_remaining = int(p.get("skipping_next", 4))
+                elif "CIRCUIT_BREAKER_TICK" in line:
+                    p = _parse(line)
+                    skip_remaining = int(p.get("skip_remaining", 0))
+            for t in trades:
+                t["status"] = "cancelled" if t.get("order_id", "") in cancelled_ids else "open"
 
             bankroll = float(latest.get("bankroll", "0").replace("$", ""))
             pnl = float(latest.get("pnl", "0").replace("$", "").replace("+", ""))
@@ -595,7 +608,7 @@ async def all_status():
             wins = int(tr.split("W")[0]) if "W" in tr else 0
             losses = int(tr.split("/")[1].replace("L", "")) if "/" in tr else 0
 
-            result["contrarian"] = {
+            result["sniper"] = {
                 "bankroll": bankroll,
                 "pnl": pnl,
                 "trades": wins + losses,
@@ -604,15 +617,59 @@ async def all_status():
                 "win_rate": latest.get("win_rate", "--"),
                 "open": int(latest.get("open", "0")),
                 "btc": btc,
-                "pending": latest.get("pending", "no") != "no",
                 "period_elapsed": latest.get("period_elapsed", ""),
+                "circuit": latest.get("circuit", "ok"),
+                "skip_remaining": skip_remaining,
                 "recent_trades": trades[-10:],
-                "recent_signals": signals[-5:],
+                "recent_resolved": resolved[-10:],
             }
         except Exception:
             pass
 
-    # --- Power trader ---
+    # --- Certainty Sniper bot ---
+    cslog = base / "certainty_sniper_output.log"
+    if cslog.exists():
+        try:
+            lines = cslog.read_text().strip().split("\n")
+            cs_trades = []
+            cs_resolved = []
+            cs_latest = {}
+            cs_cancelled_ids: set = set()
+            for line in lines[-1000:]:
+                if "certainty_status" in line:
+                    cs_latest = _parse(line)
+                elif "CERTAINTY_TRADE" in line:
+                    cs_trades.append(_parse(line))
+                elif "CERTAINTY_CANCELLED" in line:
+                    p = _parse(line)
+                    cs_cancelled_ids.add(p.get("order_id", ""))
+                elif "CERTAINTY_RESOLVED" in line:
+                    cs_resolved.append(_parse(line))
+            for t in cs_trades:
+                t["status"] = "cancelled" if t.get("order_id", "") in cs_cancelled_ids else "open"
+
+            cs_bankroll = float(cs_latest.get("bankroll", "0").replace("$", ""))
+            cs_pnl = float(cs_latest.get("pnl", "0").replace("$", "").replace("+", ""))
+            cs_tr = cs_latest.get("trades", "0W/0L")
+            cs_wins = int(cs_tr.split("W")[0]) if "W" in cs_tr else 0
+            cs_losses = int(cs_tr.split("/")[1].replace("L", "")) if "/" in cs_tr else 0
+            result["certainty_sniper"] = {
+                "bankroll": cs_bankroll,
+                "pnl": cs_pnl,
+                "wins": cs_wins,
+                "losses": cs_losses,
+                "win_rate": cs_latest.get("win_rate", "--"),
+                "open": int(cs_latest.get("open", "0")),
+                "btc": float(cs_latest.get("btc", "0")),
+                "period_elapsed": cs_latest.get("period_elapsed", ""),
+                "circuit": cs_latest.get("circuit", "ok"),
+                "recent_trades": cs_trades[-10:],
+                "recent_resolved": cs_resolved[-10:],
+            }
+        except Exception:
+            pass
+
+    # --- Power trader (state file + live log) ---
     pt_state = base / "data" / "power_trade_state.json"
     if pt_state.exists():
         try:
@@ -636,24 +693,67 @@ async def all_status():
         except Exception:
             pass
 
-    # --- AI monitor ---
-    ai_log = base / "data" / "ai_monitor.log"
-    if ai_log.exists():
+    # Augment power trader with live log data
+    ptlog = base / "power_trade_output.log"
+    if ptlog.exists():
         try:
-            text = ai_log.read_text().strip()
-            blocks = text.split("──────────────────────────────────────────")
-            if len(blocks) >= 2:
-                last = blocks[-1].strip()
-                for line in last.split("\n"):
-                    line = line.strip()
-                    if line.startswith("[") and line.endswith("]"):
-                        result["ai_monitor"]["timestamp"] = line.strip("[]")
-                    elif line.startswith("STATUS:"):
-                        result["ai_monitor"]["status"] = line.split(":", 1)[1].strip()
-                    elif line.startswith("SUMMARY:"):
-                        result["ai_monitor"]["summary"] = line.split(":", 1)[1].strip()
-                    elif line.startswith("ISSUES:"):
-                        result["ai_monitor"]["issues"] = line.split(":", 1)[1].strip()
+            lines = ptlog.read_text().strip().split("\n")
+            pt_latest = {}
+            pt_signals = []
+            pt_trades = []
+            pt_sleeping = ""
+            for line in lines[-500:]:  # only last 500 lines for performance
+                if "power_status" in line:
+                    pt_latest = _parse(line)
+                elif "power_signal" in line:
+                    pt_signals.append(_parse(line))
+                elif "power_executing" in line:
+                    pt_trades.append(_parse(line))
+                elif "power_sleeping" in line:
+                    p = _parse(line)
+                    pt_sleeping = p.get("next", "")
+                elif "trade_error" in line:
+                    pass  # errors counted separately
+
+            if pt_latest:
+                result["power_trader"].update({
+                    "bankroll": float(pt_latest.get("bankroll", result["power_trader"]["bankroll"]).replace("$", "")),
+                    "cycle": int(pt_latest.get("cycle", 0)),
+                    "total_trades": int(pt_latest.get("total", 0)),
+                    "open_trades": int(pt_latest.get("open", 0)),
+                    "sleeping_until": pt_sleeping,
+                    "recent_signals": pt_signals[-5:],
+                    "recent_executions": [{**t, "size": float(t.get("size", "0").replace("$", ""))} for t in pt_trades[-5:]],
+                })
+        except Exception:
+            pass
+
+    # --- Wallet USDC (cached from last redemption/update) ---
+    wallet_state = base / "data" / "wallet_state.json"
+    if wallet_state.exists():
+        try:
+            ws = jsonmod.loads(wallet_state.read_text())
+            result["wallet_usdc"] = float(ws.get("usdc", 0))
+        except Exception:
+            pass
+
+    # --- Daily compounder ---
+    dc_state = base / "data" / "daily_compounder_state.json"
+    if dc_state.exists():
+        try:
+            state = jsonmod.loads(dc_state.read_text())
+            dc_trades = [t for t in state.get("trades", []) if t.get("status") == "open"]
+            dc_closed = [t for t in state.get("trades", []) if t.get("status") in ("won", "lost")]
+            dc_wins = sum(1 for t in dc_closed if t.get("status") == "won")
+            dc_pnl = sum(t.get("pnl", 0) for t in dc_closed if isinstance(t.get("pnl"), (int, float)))
+            result["daily_compounder"] = {
+                "bankroll": state.get("bankroll", 0),
+                "open_trades": len(dc_trades),
+                "closed_trades": len(dc_closed),
+                "wins": dc_wins,
+                "pnl": dc_pnl,
+                "total_invested": state.get("total_invested", 0),
+            }
         except Exception:
             pass
 
