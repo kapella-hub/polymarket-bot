@@ -278,7 +278,7 @@ function render() {
   }
 
   // ── Certainty Sniper ──────────────────────────
-  const cs = data.certainty_sniper || {};
+  const cs = D.certainty_sniper || {};
   if (cs.bankroll > 0 || (cs.recent_trades||[]).length) {
     const csSection = el('div', 'section');
     csSection.append(el('div', 'section-title', 'Certainty Sniper — Late-Period'));
