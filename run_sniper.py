@@ -79,6 +79,9 @@ CONTINUATION_REVERSAL_WINDOW_SEC    = 60
 CONTINUATION_REVERSAL_BLOCK_PCT     = 0.0012  # 0.12% peak-to-current counter-move
 CONTINUATION_SIZE_MULT              = 0.55
 CONTINUATION_MAX_TRADES_PER_PERIOD  = 1
+# Separate price cap for continuation — fires AFTER market move, so entry naturally higher.
+# Break-even at 0.88 = 89.8% WR; backtest 91.7% keeps positive EV margin.
+CONTINUATION_MAX_ENTRY_PRICE        = 0.88
 
 
 def _get_price_at(history: deque, target_ts: float) -> float | None:
@@ -537,7 +540,7 @@ async def main():
                             else:
                                 entry_price = best_ask if best_ask > 0 else (
                                     market["up_price"] if direction == "up" else market["down_price"])
-                                if entry_price > MAX_ENTRY_PRICE:
+                                if entry_price > CONTINUATION_MAX_ENTRY_PRICE:
                                     skip_reason = "price_cap_fail"
                                 elif sum(1 for t in open_trades if t.get("status") == "placed") >= MAX_CONCURRENT:
                                     skip_reason = "max_concurrent_reached"
