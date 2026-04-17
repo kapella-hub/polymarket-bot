@@ -222,3 +222,334 @@ async def cancel_order(loop, clob: ClobClient, order_id: str) -> bool:
     except Exception as e:
         logger.debug("cancel_error", order_id=order_id[:16], error=str(e))
         return False
+
+
+async def main():
+    duration      = int(sys.argv[1])   if len(sys.argv) > 1 else 604800  # 7 days
+    bankroll_init = float(sys.argv[2]) if len(sys.argv) > 2 else 0.0
+
+    clob = create_clob()
+    http = httpx.AsyncClient(timeout=10)
+    loop = asyncio.get_event_loop()
+
+    state = load_state()
+    if bankroll_init > 0:
+        state["bankroll"] = bankroll_init
+        state["daily_start_bankroll"] = bankroll_init
+        state["daily_start_date"] = datetime.now(timezone.utc).date().isoformat()
+        save_state(state)
+
+    bankroll = state["bankroll"]
+    consecutive_losses = state.get("consecutive_losses", 0)
+
+    # Start Binance WebSocket
+    ws_feed = BinanceWSFeed()
+    ws_task = asyncio.create_task(ws_feed.run())
+
+    for _ in range(100):
+        if ws_feed.get("BTC"):
+            break
+        await asyncio.sleep(0.1)
+
+    if not ws_feed.get("BTC"):
+        logger.error("no_btc_price_timeout")
+        return
+
+    logger.info("certainty_sniper_ready",
+                btc=ws_feed.get("BTC"), bankroll=round(bankroll, 2))
+
+    current_period     = 0
+    hist_start: dict[int, dict[str, float]] = {}
+    open_trades: list[dict] = []
+    fired_this_period: set[str] = set()
+    skip_signals  = 0
+    last_skip_period = 0
+    last_check_ts = 0
+    last_status   = 0
+    start_time    = time.time()
+
+    try:
+        while time.time() - start_time < duration:
+            now_ts    = int(time.time())
+            period_ts = (now_ts // 900) * 900
+            elapsed   = now_ts - period_ts
+
+            # ── NEW PERIOD ────────────────────────────────────
+            if period_ts != current_period:
+                fired_this_period.clear()
+                last_check_ts = 0
+
+                if skip_signals > 0 and period_ts != last_skip_period:
+                    skip_signals -= 1
+                    last_skip_period = period_ts
+                    logger.info("CIRCUIT_BREAKER_TICK", skip_remaining=skip_signals)
+
+                # Record period-start prices
+                hist_start[period_ts] = {
+                    asset: ws_feed.get(asset)
+                    for asset in COIN_TO_ASSET.values()
+                    if ws_feed.get(asset)
+                }
+                # Prune old history
+                cutoff = period_ts - 4 * 900
+                for old_ts in [k for k in list(hist_start) if k < cutoff]:
+                    del hist_start[old_ts]
+
+                current_period = period_ts
+
+                # Reset daily loss tracking at start of new UTC day
+                today = datetime.now(timezone.utc).date().isoformat()
+                if state.get("daily_start_date") != today:
+                    state["daily_start_bankroll"] = bankroll
+                    state["daily_start_date"] = today
+                    save_state(state)
+
+            # ── STATUS HEARTBEAT (every 60s) ──────────────────
+            if now_ts - last_status >= 60:
+                wins   = sum(1 for t in state["trades"] if t.get("status") == "won")
+                losses = sum(1 for t in state["trades"] if t.get("status") == "lost")
+                total  = wins + losses
+                wr     = ("%.0f%%" % (wins / total * 100)) if total else "--"
+                pnl    = sum(t.get("pnl", 0) for t in state["trades"])
+                logger.info("certainty_status",
+                            bankroll=round(bankroll, 2),
+                            btc=ws_feed.get("BTC"),
+                            open=sum(1 for t in open_trades if t["status"] == "placed"),
+                            trades="%dW/%dL" % (wins, losses),
+                            win_rate=wr,
+                            pnl=round(pnl, 2),
+                            period_elapsed="%ds" % elapsed,
+                            circuit="skip%d" % skip_signals if skip_signals else "ok")
+                last_status = now_ts
+
+            # ── DAILY LOSS LIMIT ──────────────────────────────
+            daily_start = state.get("daily_start_bankroll", bankroll)
+            if daily_start > 0 and (daily_start - bankroll) / daily_start >= DAILY_LOSS_PCT:
+                logger.warning("daily_loss_limit_hit",
+                               start=round(daily_start, 2), now=round(bankroll, 2))
+                await asyncio.sleep(300)
+                continue
+
+            # ── MIN BANKROLL ──────────────────────────────────
+            if bankroll < MIN_BANKROLL:
+                logger.warning("bankroll_too_low", bankroll=round(bankroll, 2))
+                await asyncio.sleep(60)
+                continue
+
+            # ── CERTAINTY WINDOW: minutes 12–14 ──────────────
+            in_window = CERTAINTY_START <= elapsed <= CERTAINTY_END
+            check_due = (now_ts - last_check_ts) >= CHECK_INTERVAL
+
+            if in_window and check_due and skip_signals == 0:
+                last_check_ts = now_ts
+                period_prices = hist_start.get(current_period, {})
+                all_moves     = compute_all_moves(ws_feed, period_prices)
+
+                for coin in COINS:
+                    if coin in fired_this_period:
+                        continue
+
+                    move = all_moves.get(coin, 0.0)
+                    passed_g1, _ = gate1_move(
+                        cur=ws_feed.get(COIN_TO_ASSET[coin]),
+                        start=period_prices.get(COIN_TO_ASSET[coin]),
+                    )
+                    if not passed_g1:
+                        continue
+
+                    direction = "up" if move > 0 else "down"
+                    if not gate2_confirm(all_moves, direction):
+                        continue
+
+                    # Gate 3 — order book (async, with timeout guard)
+                    try:
+                        ob_ok = await asyncio.wait_for(
+                            gate3_orderbook(http, coin, direction), timeout=3)
+                    except asyncio.TimeoutError:
+                        ob_ok = False
+                    if not ob_ok:
+                        logger.debug("certainty_skip_gate3", coin=coin, move="%.3f%%" % (move * 100))
+                        continue
+
+                    # All 3 gates passed — fetch fresh market price
+                    market = await fetch_market_price(http, coin, current_period)
+                    if not market:
+                        logger.warning("certainty_no_market", coin=coin)
+                        continue
+
+                    side     = "buy_up" if direction == "up" else "buy_down"
+                    raw_price = market["up_price"] if direction == "up" else market["down_price"]
+                    entry_price = round(min(raw_price + 0.01, 0.99), 4)
+
+                    if entry_price > MAX_ENTRY_PRICE:
+                        logger.info("certainty_skip",
+                                    reason="entry_too_high",
+                                    coin=coin, price=entry_price)
+                        fired_this_period.add(coin)
+                        continue
+
+                    token_id = market["up_token_id"] if direction == "up" else market["down_token_id"]
+                    size_usd = min(kelly_size(bankroll), bankroll - 5)
+                    if size_usd < BET_MIN:
+                        continue
+
+                    tokens = size_usd / entry_price
+
+                    logger.info("certainty_signal",
+                                coin=coin, direction=direction,
+                                move="%.3f%%" % (move * 100),
+                                entry_price=entry_price,
+                                size_usd=round(size_usd, 2),
+                                elapsed=elapsed)
+
+                    order_id = await place_order(loop, clob, token_id, entry_price, tokens)
+                    if not order_id:
+                        continue
+
+                    bankroll -= size_usd
+                    state["bankroll"]        = bankroll
+                    state["total_invested"]  = state.get("total_invested", 0) + size_usd
+
+                    trade = {
+                        "period":       current_period,
+                        "coin":         coin,
+                        "side":         side,
+                        "token_id":     token_id,
+                        "condition_id": market["condition_id"],
+                        "entry_price":  entry_price,
+                        "size_usd":     round(size_usd, 2),
+                        "tokens":       round(tokens, 4),
+                        "order_id":     order_id,
+                        "placed_at":    time.time(),
+                        "cancel_at":    time.time() + CANCEL_AFTER,
+                        "period_end":   current_period + 900,
+                        "move_pct":     round(move * 100, 3),
+                        "btc_at_entry": ws_feed.get("BTC"),
+                        "status":       "placed",
+                        "pnl":          0,
+                    }
+                    open_trades.append(trade)
+                    state["trades"].append(trade)
+                    fired_this_period.add(coin)
+                    save_state(state)
+
+                    logger.info("CERTAINTY_TRADE",
+                                coin=coin.upper(), side=side,
+                                move="%.3f%%" % (move * 100),
+                                entry_price=entry_price,
+                                size_usd=round(size_usd, 2),
+                                tokens=round(tokens, 2),
+                                elapsed=elapsed,
+                                bankroll=round(bankroll, 2),
+                                order_id=order_id[:16])
+
+            # ── CANCEL UNFILLED ORDERS ────────────────────────
+            now_f = time.time()
+            for trade in list(open_trades):
+                if trade["status"] != "placed":
+                    continue
+                if now_f < trade.get("cancel_at", float("inf")):
+                    continue
+                cancelled = await cancel_order(loop, clob, trade["order_id"])
+                if cancelled:
+                    bankroll += trade["size_usd"]
+                    state["bankroll"] = bankroll
+                    trade["status"] = "cancelled"
+                    trade["pnl"]    = 0
+                    save_state(state)
+                    logger.info("CERTAINTY_CANCELLED",
+                                coin=trade["coin"].upper(),
+                                order_id=trade["order_id"][:16])
+                else:
+                    trade["cancel_at"] = now_f + 15
+
+            # ── RESOLVE TRADES (period_end + 120s grace) ──────
+            for trade in list(open_trades):
+                if trade["status"] != "placed":
+                    continue
+                if now_ts <= trade["period_end"] + 120:
+                    continue
+
+                coin  = trade["coin"]
+                asset = COIN_TO_ASSET[coin]
+                t_per = trade["period"]
+
+                start_p = hist_start.get(t_per, {}).get(asset)
+                end_p   = ws_feed.get(asset)
+
+                if not start_p:
+                    trade["status"] = "pending_settlement"
+                    continue
+
+                actual_move = ((end_p - start_p) / start_p) if end_p else 0
+                won = (
+                    (trade["side"] == "buy_up"   and actual_move > 0) or
+                    (trade["side"] == "buy_down"  and actual_move < 0)
+                )
+
+                if won:
+                    payout = trade["tokens"] * 0.98  # 2% Polymarket fee
+                    trade["pnl"]    = round(payout - trade["size_usd"], 2)
+                    trade["status"] = "won"
+                    bankroll += payout
+                    state["total_returned"] = state.get("total_returned", 0) + payout
+                    consecutive_losses = 0
+                else:
+                    trade["pnl"]    = -trade["size_usd"]
+                    trade["status"] = "lost"
+                    consecutive_losses += 1
+                    if consecutive_losses >= CIRCUIT_LOSSES:
+                        skip_signals = CIRCUIT_SKIP
+                        logger.warning("CIRCUIT_BREAKER",
+                                       consecutive_losses=consecutive_losses,
+                                       skipping_next=CIRCUIT_SKIP)
+                        consecutive_losses = 0
+
+                state["bankroll"]            = bankroll
+                state["consecutive_losses"]  = consecutive_losses
+                save_state(state)
+
+                wins_total   = sum(1 for t in state["trades"] if t.get("status") == "won")
+                losses_total = sum(1 for t in state["trades"] if t.get("status") == "lost")
+                total_t      = wins_total + losses_total
+                wr           = ("%.0f%%" % (wins_total / total_t * 100)) if total_t else "--"
+
+                logger.info("CERTAINTY_RESOLVED",
+                            coin=coin.upper(),
+                            side=trade["side"],
+                            won=won,
+                            pnl=trade["pnl"],
+                            bankroll=round(bankroll, 2),
+                            win_rate=wr,
+                            trades="%dW/%dL" % (wins_total, losses_total))
+
+                open_trades = [t for t in open_trades if t["status"] not in ("won", "lost", "cancelled")]
+
+            await asyncio.sleep(1)
+
+    finally:
+        ws_task.cancel()
+        await http.aclose()
+        save_state(state)
+        logger.info("certainty_sniper_stopped", bankroll=round(bankroll, 2))
+
+
+if __name__ == "__main__":
+    import logging
+    logging.basicConfig(
+        handlers=[
+            logging.FileHandler(LOG_FILE, mode='a'),
+            logging.StreamHandler(),
+        ],
+        format="%(message)s",
+        level=logging.DEBUG,
+    )
+    structlog.configure(
+        processors=[
+            structlog.stdlib.add_log_level,
+            structlog.stdlib.PositionalArgumentsFormatter(),
+            structlog.dev.ConsoleRenderer(colors=False),
+        ],
+        logger_factory=structlog.stdlib.LoggerFactory(),
+    )
+    asyncio.run(main())
