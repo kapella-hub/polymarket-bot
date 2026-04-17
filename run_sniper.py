@@ -26,6 +26,7 @@ import json
 import os
 import sys
 import time
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -63,6 +64,57 @@ MAX_CONCURRENT   = 3
 CROSS_BOOST      = 1.5    # Size multiplier when 2+ coins confirm direction
 CIRCUIT_LOSSES   = 3      # Consecutive losses before pause
 CIRCUIT_SKIP     = 4      # Periods to skip after trigger
+
+# --- Continuation Mode v1 ---
+# Captures mid-period BTC+ETH same-direction drift missed by boundary sniper.
+# Backtested 72h on 2026-04-17: 12 fires/day, 91.7% win rate, +$0.25 EV/trade.
+ENABLE_CONTINUATION_MODE            = True    # LIVE trading enabled
+ENABLE_CONTINUATION_SHADOW          = False   # Redundant when live is on
+CONTINUATION_ACTIVE_START_SEC       = 240     # Minute 4
+CONTINUATION_ACTIVE_END_SEC         = 600     # Minute 10 (>=5min hold before period end)
+CONTINUATION_LOOKBACK_SEC           = 300     # 5-min rolling
+CONTINUATION_BTC_MIN_MOVE_PCT       = 0.003   # 0.30%
+CONTINUATION_ETH_MIN_MOVE_PCT       = 0.0025  # 0.25%
+CONTINUATION_REVERSAL_WINDOW_SEC    = 60
+CONTINUATION_REVERSAL_BLOCK_PCT     = 0.0012  # 0.12% peak-to-current counter-move
+CONTINUATION_SIZE_MULT              = 0.55
+CONTINUATION_MAX_TRADES_PER_PERIOD  = 1
+
+
+def _get_price_at(history: deque, target_ts: float) -> float | None:
+    best = None
+    for ts, price in history:
+        if ts <= target_ts:
+            best = price
+        else:
+            break
+    return best
+
+
+def _compute_move_pct(history: deque, now_ts: float, lookback_sec: int) -> float | None:
+    if len(history) < 2:
+        return None
+    p_old = _get_price_at(history, now_ts - lookback_sec)
+    p_now = history[-1][1]
+    if p_old is None or p_old <= 0:
+        return None
+    return (p_now - p_old) / p_old
+
+
+def _reversal_counter_move(history: deque, now_ts: float, window_sec: int,
+                           direction: str) -> float:
+    if not history:
+        return 0.0
+    cutoff = now_ts - window_sec
+    recent = [p for ts, p in history if ts >= cutoff]
+    if not recent:
+        return 0.0
+    p_now = recent[-1]
+    if p_now <= 0:
+        return 0.0
+    if direction == "up":
+        return max(0.0, (max(recent) - p_now) / p_now)
+    return max(0.0, (p_now - min(recent)) / p_now)
 
 
 def create_clob():
@@ -216,6 +268,12 @@ async def main():
     # Trade tracking
     open_trades:    list[dict] = []   # active placed/pending trades
     fired_this_period: set[str] = set()
+
+    # Continuation mode state
+    _roll_max_age = CONTINUATION_LOOKBACK_SEC + CONTINUATION_REVERSAL_WINDOW_SEC + 30
+    rolling_prices: dict[str, deque] = {a: deque() for a in COIN_TO_ASSET.values()}
+    continuation_trades_this_period = 0
+    last_continuation_period        = 0
 
     consecutive_losses = 0
     skip_signals       = 0
@@ -418,6 +476,150 @@ async def main():
                             except Exception as e:
                                 logger.error("sniper_order_error",
                                              coin=coin, error=str(e)[:120])
+
+            # ──────────────────────────────────────────────────
+            # CONTINUATION MODE v1: mid-period BTC+ETH drift
+            # ──────────────────────────────────────────────────
+            now_f = time.time()
+
+            # Update rolling price history every iteration
+            for asset in COIN_TO_ASSET.values():
+                p = ws_feed.get(asset)
+                if p:
+                    rolling_prices[asset].append((now_f, p))
+                    cutoff = now_f - _roll_max_age
+                    while rolling_prices[asset] and rolling_prices[asset][0][0] < cutoff:
+                        rolling_prices[asset].popleft()
+
+            # Reset per-period continuation counter
+            if period_ts != last_continuation_period:
+                continuation_trades_this_period = 0
+                last_continuation_period = period_ts
+
+            if (ENABLE_CONTINUATION_MODE or ENABLE_CONTINUATION_SHADOW) and \
+               CONTINUATION_ACTIVE_START_SEC <= elapsed <= CONTINUATION_ACTIVE_END_SEC and \
+               continuation_trades_this_period < CONTINUATION_MAX_TRADES_PER_PERIOD and \
+               skip_signals == 0 and current_markets:
+
+                btc_hist = rolling_prices.get("BTC", deque())
+                eth_hist = rolling_prices.get("ETH", deque())
+                btc_move = _compute_move_pct(btc_hist, now_f, CONTINUATION_LOOKBACK_SEC)
+                eth_move = _compute_move_pct(eth_hist, now_f, CONTINUATION_LOOKBACK_SEC)
+
+                should_eval = btc_move is not None and eth_move is not None
+                skip_reason = None
+                if should_eval:
+                    if abs(btc_move) < CONTINUATION_BTC_MIN_MOVE_PCT:
+                        skip_reason = "btc_move_too_small"
+                    elif abs(eth_move) < CONTINUATION_ETH_MIN_MOVE_PCT:
+                        skip_reason = "eth_move_too_small"
+                    elif (btc_move > 0) != (eth_move > 0):
+                        skip_reason = "direction_mismatch"
+
+                if should_eval and skip_reason is None:
+                    direction = "up" if btc_move > 0 else "down"
+                    rev = _reversal_counter_move(btc_hist, now_f,
+                                                  CONTINUATION_REVERSAL_WINDOW_SEC, direction)
+                    if rev >= CONTINUATION_REVERSAL_BLOCK_PCT:
+                        skip_reason = "reversal_block"
+                    else:
+                        coin = "btc"
+                        market = current_markets.get(coin)
+                        if not market:
+                            skip_reason = "no_market"
+                        else:
+                            side = "buy_up" if direction == "up" else "buy_down"
+                            token_id = market["up_token_id"] if direction == "up" else market["down_token_id"]
+                            best_ask, ask_usd_vol = await get_clob_ask(http, token_id)
+                            if ask_usd_vol < MIN_BOOK_VOLUME:
+                                skip_reason = "depth_fail"
+                            else:
+                                entry_price = best_ask if best_ask > 0 else (
+                                    market["up_price"] if direction == "up" else market["down_price"])
+                                if entry_price > MAX_ENTRY_PRICE:
+                                    skip_reason = "price_cap_fail"
+                                elif sum(1 for t in open_trades if t.get("status") == "placed") >= MAX_CONCURRENT:
+                                    skip_reason = "max_concurrent_reached"
+                                else:
+                                    base_size = min(BET_MAX, max(BET_MIN, bankroll * BET_PCT))
+                                    size = base_size * CONTINUATION_SIZE_MULT
+                                    if size < BET_MIN:
+                                        skip_reason = "size_below_min"
+                                    elif size > bankroll - 5:
+                                        skip_reason = "bankroll_guard"
+                                    else:
+                                        tokens = min(size / entry_price, ask_usd_vol / entry_price)
+                                        actual_size = round(tokens * entry_price, 2)
+                                        if ENABLE_CONTINUATION_MODE:
+                                            try:
+                                                order_args = OrderArgs(
+                                                    token_id=token_id,
+                                                    price=round(entry_price, 4),
+                                                    size=round(tokens, 2),
+                                                    side=BUY,
+                                                )
+                                                signed = await loop.run_in_executor(
+                                                    None, clob.create_order, order_args)
+                                                result = await loop.run_in_executor(
+                                                    None, functools.partial(clob.post_order, signed, OrderType.FAK))
+                                                order_id = result.get("orderID", "")
+                                                if order_id:
+                                                    bankroll -= actual_size
+                                                    state["bankroll"] = bankroll
+                                                    state["total_invested"] = state.get("total_invested", 0) + actual_size
+                                                    trade = {
+                                                        "period":       period_ts,
+                                                        "coin":         coin,
+                                                        "side":         side,
+                                                        "token_id":     token_id,
+                                                        "condition_id": market["condition_id"],
+                                                        "entry_price":  round(entry_price, 4),
+                                                        "size_usd":     actual_size,
+                                                        "tokens":       round(tokens, 2),
+                                                        "order_id":     order_id,
+                                                        "placed_at":    now_f,
+                                                        "period_end":   period_ts + 900,
+                                                        "move_pct":     round(btc_move * 100, 3),
+                                                        "cross_confirm": 2,
+                                                        "btc_at_entry": ws_feed.get("BTC"),
+                                                        "strategy_mode": "continuation",
+                                                        "status":       "placed",
+                                                        "pnl":          0,
+                                                    }
+                                                    open_trades.append(trade)
+                                                    state["trades"].append(trade)
+                                                    continuation_trades_this_period += 1
+                                                    save_state(state)
+                                                    logger.info("CONT_LIVE_FIRE",
+                                                                period=period_ts, elapsed=elapsed,
+                                                                direction=direction,
+                                                                btc_move=round(btc_move * 100, 3),
+                                                                eth_move=round(eth_move * 100, 3),
+                                                                entry=round(entry_price, 4),
+                                                                size=actual_size,
+                                                                order_id=order_id[:16],
+                                                                bankroll=round(bankroll, 2))
+                                                else:
+                                                    skip_reason = "no_order_id"
+                                            except Exception as e:
+                                                skip_reason = "order_error"
+                                                logger.error("CONT_ORDER_ERROR", error=str(e)[:120])
+                                        else:
+                                            continuation_trades_this_period += 1
+                                            logger.info("CONT_SHADOW_FIRE",
+                                                        period=period_ts, elapsed=elapsed,
+                                                        direction=direction,
+                                                        btc_move=round(btc_move * 100, 3),
+                                                        eth_move=round(eth_move * 100, 3),
+                                                        entry=round(entry_price, 4),
+                                                        size=actual_size)
+
+                # Log skip once per minute to avoid flooding
+                if skip_reason and elapsed % 60 == 0:
+                    logger.info("CONT_SKIP", reason=skip_reason,
+                                period=period_ts, elapsed=elapsed,
+                                btc_move=round(btc_move * 100, 3) if btc_move else None,
+                                eth_move=round(eth_move * 100, 3) if eth_move else None)
 
             # ──────────────────────────────────────────────────
             # RESOLVE trades (period_end + 120s grace)

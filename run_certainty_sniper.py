@@ -60,8 +60,9 @@ MIN_CONFIRMING     = 2      # Gate 2: need >=2 confirming coins
 MAX_ENTRY_PRICE    = 0.92   # Skip if market already priced certainty in
 
 # Sizing
-BET_MIN        = 8.0
-BET_MAX        = 40.0
+BET_MIN              = 8.0
+BET_MAX              = 40.0
+MAX_BET_PCT_BANKROLL = 0.15   # Hard ceiling — guards against over-optimistic win_rate
 
 # Risk controls
 CIRCUIT_LOSSES    = 2     # Consecutive losses before pause
@@ -71,10 +72,12 @@ MIN_BANKROLL      = 30.0  # Stop trading below this
 
 
 def kelly_size(bankroll: float, win_rate: float = 0.90, avg_entry: float = 0.85) -> float:
-    """Half-Kelly bet size. Returns dollars to risk."""
-    b = (1.0 - avg_entry) / avg_entry  # net return per dollar at avg_entry
+    """Half-Kelly with hard 15% bankroll cap. Protects against mis-estimated win_rate."""
+    b = (1.0 - avg_entry) / avg_entry
     kelly = (win_rate * b - (1.0 - win_rate)) / b
     size = bankroll * (kelly / 2.0)
+    pct_cap = bankroll * MAX_BET_PCT_BANKROLL
+    size = min(size, pct_cap)
     return min(BET_MAX, max(BET_MIN, round(size, 2)))
 
 
