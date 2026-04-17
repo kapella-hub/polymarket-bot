@@ -78,3 +78,19 @@ def test_compute_all_moves_missing_price():
     moves = compute_all_moves(feed, period_prices)
     assert "btc" in moves
     assert "eth" not in moves  # skipped — no current price
+
+
+def test_kelly_size_unclamped():
+    # bankroll=120 puts raw half-Kelly size ~within [8, 40], pins actual formula output
+    size = kelly_size(bankroll=120.0)
+    assert abs(size - 20.0) < 0.10  # formula gives bankroll * ~16.67%
+
+
+def test_gate1_move_none_price():
+    passed, move = gate1_move(cur=None, start=100.0)
+    assert passed is False
+
+
+def test_gate2_confirm_down_fails():
+    moves = {"btc": -0.009, "eth": -0.002, "sol": 0.001, "xrp": 0.001, "doge": 0.001, "bnb": 0.003}
+    assert gate2_confirm(moves, "down") is False  # only btc <=-0.5% down

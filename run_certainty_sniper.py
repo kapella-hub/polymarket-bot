@@ -46,7 +46,7 @@ COIN_TO_ASSET = {"btc": "BTC", "eth": "ETH", "sol": "SOL",
 
 # Timing
 CERTAINTY_START  = 720   # 12 min into period — start checking
-CERTAINTY_END    = 840   # 14 min into period — stop (3 min to resolve)
+CERTAINTY_END    = 840   # 14 min into period — stop (60s remaining in period)
 CHECK_INTERVAL   = 30    # Check every 30s in window
 CANCEL_AFTER     = 20    # Cancel unfilled order after 20s
 
@@ -57,7 +57,6 @@ MIN_CONFIRMING     = 2      # Gate 2: need >=2 confirming coins
 MAX_ENTRY_PRICE    = 0.92   # Skip if market already priced certainty in
 
 # Sizing
-HALF_KELLY_PCT = 0.23   # Half-Kelly at 90% estimated win rate
 BET_MIN        = 8.0
 BET_MAX        = 40.0
 
@@ -86,6 +85,8 @@ def gate1_move(cur: float, start: float) -> tuple[bool, float]:
 
 def gate2_confirm(all_moves: dict[str, float], target_direction: str) -> bool:
     """Gate 2: >=MIN_CONFIRMING coins moved >=CONFIRM_MOVE_PCT in same direction."""
+    # all_moves includes the target coin (which passed Gate 1 >= MIN_MOVE_PCT > CONFIRM_MOVE_PCT),
+    # so effective requirement is >= (MIN_CONFIRMING - 1) OTHER coins confirming.
     if target_direction == "up":
         confirming = sum(1 for m in all_moves.values() if m >= CONFIRM_MOVE_PCT)
     else:
