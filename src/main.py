@@ -558,7 +558,7 @@ async def all_status():
         "certainty_sniper": {"bankroll": 0, "pnl": 0, "wins": 0, "losses": 0,
                              "win_rate": "--", "open": 0, "btc": 0, "period_elapsed": "",
                              "circuit": "ok", "recent_trades": [], "recent_resolved": []},
-        "power_trader": {"bankroll": 0, "positions": [], "total_invested": 0},
+        "open_positions": [],
         "wallet_usdc": 0,
         "ai_monitor": {"status": "none", "summary": "", "issues": "", "timestamp": ""},
     }
@@ -669,62 +669,22 @@ async def all_status():
         except Exception:
             pass
 
-    # --- Power trader (state file + live log) ---
+    # --- Open long-term positions (from legacy power_trade_state.json) ---
     pt_state = base / "data" / "power_trade_state.json"
     if pt_state.exists():
         try:
             state = jsonmod.loads(pt_state.read_text())
-            positions = []
             for t in state.get("trades", []):
                 if t.get("status") == "open":
-                    positions.append({
+                    result["open_positions"].append({
                         "question": t.get("question", "")[:50],
                         "side": t.get("side", ""),
                         "price": t.get("price", 0),
                         "size": t.get("size_usd", 0),
                         "tokens": t.get("tokens", 0),
                         "entry_time": t.get("entry_time", ""),
+                        "end_date": t.get("end_date", ""),
                     })
-            result["power_trader"] = {
-                "bankroll": state.get("bankroll", 0),
-                "positions": positions,
-                "total_invested": state.get("total_invested", 0),
-            }
-        except Exception:
-            pass
-
-    # Augment power trader with live log data
-    ptlog = base / "power_trade_output.log"
-    if ptlog.exists():
-        try:
-            lines = ptlog.read_text().strip().split("\n")
-            pt_latest = {}
-            pt_signals = []
-            pt_trades = []
-            pt_sleeping = ""
-            for line in lines[-500:]:  # only last 500 lines for performance
-                if "power_status" in line:
-                    pt_latest = _parse(line)
-                elif "power_signal" in line:
-                    pt_signals.append(_parse(line))
-                elif "power_executing" in line:
-                    pt_trades.append(_parse(line))
-                elif "power_sleeping" in line:
-                    p = _parse(line)
-                    pt_sleeping = p.get("next", "")
-                elif "trade_error" in line:
-                    pass  # errors counted separately
-
-            if pt_latest:
-                result["power_trader"].update({
-                    "bankroll": float(pt_latest.get("bankroll", result["power_trader"]["bankroll"]).replace("$", "")),
-                    "cycle": int(pt_latest.get("cycle", 0)),
-                    "total_trades": int(pt_latest.get("total", 0)),
-                    "open_trades": int(pt_latest.get("open", 0)),
-                    "sleeping_until": pt_sleeping,
-                    "recent_signals": pt_signals[-5:],
-                    "recent_executions": [{**t, "size": float(t.get("size", "0").replace("$", ""))} for t in pt_trades[-5:]],
-                })
         except Exception:
             pass
 

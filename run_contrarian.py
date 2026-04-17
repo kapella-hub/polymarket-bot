@@ -110,6 +110,8 @@ async def main():
     next_period_btc_market = None  # Pre-fetched market for next period
     next_period_prefetched = False  # Whether we've tried to pre-fetch
     loop = asyncio.get_event_loop()
+    consecutive_losses = 0   # Circuit breaker: track losing streak
+    skip_signals = 0          # Periods to skip after 2 consecutive losses
 
     ws_feed = BinanceWSFeed()
     ws_task = asyncio.create_task(ws_feed.run())
@@ -259,25 +261,35 @@ async def main():
                 if start_p and end_p:
                     move = (end_p - start_p) / start_p
                     if abs(move) >= min_move:
-                        # BIG MOVE detected — fade it next period
-                        if move > 0:
-                            fade = "buy_down"  # BTC went up, bet on DOWN
+                        # Circuit breaker: skip signals after 2 consecutive losses
+                        if skip_signals > 0:
+                            skip_signals -= 1
+                            logger.info(
+                                "CONTRARIAN_SKIPPED",
+                                move="%.3f%%" % (move * 100),
+                                reason="circuit_breaker",
+                                skip_remaining=skip_signals,
+                            )
                         else:
-                            fade = "buy_up"    # BTC went down, bet on UP
+                            # BIG MOVE detected — fade it next period
+                            if move > 0:
+                                fade = "buy_down"  # BTC went up, bet on DOWN
+                            else:
+                                fade = "buy_up"    # BTC went down, bet on UP
 
-                        pending_signal = {
-                            "fade_direction": fade,
-                            "trigger_move": move,
-                            "trigger_period": prev_period,
-                        }
-                        logger.info(
-                            "CONTRARIAN_SIGNAL",
-                            move="%.3f%%" % (move * 100),
-                            fade=fade,
-                            trigger_period=prev_period,
-                            btc_start=start_p,
-                            btc_end=end_p,
-                        )
+                            pending_signal = {
+                                "fade_direction": fade,
+                                "trigger_move": move,
+                                "trigger_period": prev_period,
+                            }
+                            logger.info(
+                                "CONTRARIAN_SIGNAL",
+                                move="%.3f%%" % (move * 100),
+                                fade=fade,
+                                trigger_period=prev_period,
+                                btc_start=start_p,
+                                btc_end=end_p,
+                            )
                     else:
                         logger.debug("no_signal", move="%.3f%%" % (move * 100), threshold="%.1f%%" % (min_move*100))
 
@@ -312,9 +324,18 @@ async def main():
                     trade["status"] = "won"
                     bankroll += payout
                     state["total_returned"] = state.get("total_returned", 0) + payout
+                    consecutive_losses = 0
                 else:
                     trade["pnl"] = -trade["size_usd"]
                     trade["status"] = "lost"
+                    consecutive_losses += 1
+                    if consecutive_losses >= 2 and skip_signals == 0:
+                        skip_signals = 3
+                        logger.warning(
+                            "CIRCUIT_BREAKER",
+                            consecutive_losses=consecutive_losses,
+                            skipping_next=skip_signals,
+                        )
 
                 state["bankroll"] = bankroll
                 save_state(state)
@@ -327,6 +348,7 @@ async def main():
                     bankroll=round(bankroll, 2),
                     trigger="%.2f%%" % (trade["trigger_move"]*100),
                     side=trade["side"],
+                    consecutive_losses=consecutive_losses,
                 )
 
             # Status log every 60s

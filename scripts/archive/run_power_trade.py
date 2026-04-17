@@ -106,7 +106,7 @@ async def fetch_candidate_markets() -> list:
                     continue
 
                 volume = float(m.get("volumeNum", 0))
-                if volume < 15000:
+                if volume < 50000:
                     continue
 
                 best_bid = float(m["bestBid"]) if m.get("bestBid") else None
@@ -300,6 +300,18 @@ async def run_cycle(clob, state, max_trades=3):
     trades_placed = 0
     open_ids = {t["market_id"] for t in state["trades"] if t["status"] == "open"}
 
+    # Build per-date exposure to prevent all capital clustering on one resolution date
+    date_exposure: dict = {}
+    for t in state["trades"]:
+        if t["status"] == "open":
+            d = t.get("end_date", "")[:10]
+            date_exposure[d] = date_exposure.get(d, 0) + t["size_usd"]
+    # Cap per date: 30% of total deployed capital (bankroll + open positions)
+    total_capital = state["bankroll"] + sum(
+        t["size_usd"] for t in state["trades"] if t["status"] == "open"
+    )
+    date_cap = total_capital * 0.30
+
     for market in to_analyze:
         if trades_placed >= max_trades or state["bankroll"] < 10:
             break
@@ -331,12 +343,12 @@ async def run_cycle(clob, state, max_trades=3):
             why=reasoning[:80],
         )
 
-        if confidence < 0.60:
+        if confidence < 0.65:
             continue
 
-        if edge_yes > 0.06:
+        if edge_yes > 0.05:
             side, edge = "buy_yes", edge_yes
-        elif edge_no > 0.06:
+        elif edge_no > 0.05:
             side, edge = "buy_no", edge_no
         else:
             continue
@@ -345,11 +357,27 @@ async def run_cycle(clob, state, max_trades=3):
         if size < 5:
             continue
 
+        # Enforce per-expiry-date concentration cap
+        market_date = market["end_date"][:10]
+        current_date_exp = date_exposure.get(market_date, 0)
+        if current_date_exp >= date_cap:
+            logger.info(
+                "date_cap_skip",
+                date=market_date,
+                exposure="$%.2f" % current_date_exp,
+                cap="$%.2f" % date_cap,
+            )
+            continue
+        size = min(size, date_cap - current_date_exp)
+        if size < 5:
+            continue
+
         logger.info("power_executing", q=market["question"][:40],
                      side=side, edge=f"{edge:+.3f}", size=f"${size:.2f}")
 
         if await execute_trade(clob, market, side, size, state):
             trades_placed += 1
+            date_exposure[market_date] = current_date_exp + size
 
     logger.info("power_cycle_done", placed=trades_placed, analyzed=len(to_analyze),
                 bankroll=f"${state['bankroll']:.2f}")

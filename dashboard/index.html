@@ -141,11 +141,10 @@ async function refresh() {
 function render() {
   if (!D) return;
   const sn  = D.sniper        || {};
-  const pt  = D.power_trader || {};
   const walletUsdc = D.wallet_usdc || 0;
-  const positions  = pt.positions  || [];
+  const positions  = D.open_positions || [];
 
-  const gtaPaid      = pt.total_invested || 0;
+  const gtaPaid      = positions.reduce((s,p) => s + (p.size||0), 0);
   const gtaPotential = positions.reduce((s,p) => s + (p.tokens||0) * 0.90, 0);
   const liquidTotal  = walletUsdc + (sn.bankroll||0);
   const totalPort    = liquidTotal + gtaPaid;
@@ -335,24 +334,6 @@ function render() {
       app.append(csHistSection);
     }
   }
-
-  // ── Power Trader live status ──────────────────
-  const ptLiveSection = el('div', 'section');
-  ptLiveSection.append(el('div', 'section-title', 'Power Trader — Claude AI'));
-  const ptCard = el('div', 'card');
-  const ptStatus = pt.sleeping_until ? badge('Sleeping · next ' + pt.sleeping_until, 'badge-blue')
-                 : pt.cycle > 0      ? badge('Cycle ' + pt.cycle + ' running', 'badge-amber')
-                 :                     badge('Starting', 'badge-blue');
-  const ptBkRow = el('span'); ptBkRow.textContent = usd(pt.bankroll) + '  ·  ' + (pt.total_trades||0) + ' trades placed  ·  ' + (pt.open_trades||0) + ' open';
-  ptCard.append(kvRow('Status', ptStatus));
-  ptCard.append(kvRow('Bankroll', ptBkRow));
-  if ((pt.recent_executions||[]).length) {
-    const lastEx = pt.recent_executions[pt.recent_executions.length - 1];
-    const exEl = el('span'); exEl.textContent = (lastEx.q||lastEx.edge||'recent trade') + '  ' + (lastEx.side||'') + '  ' + usd(lastEx.size||0);
-    ptCard.append(kvRow('Last Trade', exEl));
-  }
-  ptLiveSection.append(ptCard);
-  app.append(ptLiveSection);
 
   // ── Open Long-term Positions ──────────────────
   const ptSection = el('div', 'section');
