@@ -43,12 +43,15 @@ STATE_FILE = Path(__file__).parent / "data" / "certainty_sniper_state.json"
 COINS         = ["btc", "eth", "sol", "xrp", "doge", "bnb"]
 COIN_TO_ASSET = {"btc": "BTC", "eth": "ETH", "sol": "SOL",
                  "xrp": "XRP", "doge": "DOGE", "bnb": "BNB"}
+# Only trade coins with enough CLOB liquidity to support late-period entries
+LIQUID_COINS  = frozenset(["btc"])
 
 # Timing
 CERTAINTY_START  = 720   # 12 min into period — start checking
-CERTAINTY_END    = 840   # 14 min into period — stop (60s remaining in period)
+CERTAINTY_END    = 780   # 13 min into period — stop (2 min remaining, avoid liquidity desert)
 CHECK_INTERVAL   = 30    # Check every 30s in window
-CANCEL_AFTER     = 20    # Cancel unfilled order after 20s
+CANCEL_AFTER     = 5     # Cancel unfilled order quickly — need fill before period ends
+MIN_BOOK_VOLUME  = 20.0  # Min USD resting at best ask on CLOB before placing
 
 # Signal thresholds
 MIN_MOVE_PCT       = 0.007  # Gate 1: target coin moved >=0.7%
@@ -165,6 +168,26 @@ async def gate3_orderbook(client: httpx.AsyncClient, coin: str, direction: str) 
         return False  # fail safe: skip if can't check
 
 
+async def get_clob_ask(client: httpx.AsyncClient, token_id: str) -> tuple[float, float]:
+    """Fetch best ask price and USD volume resting at that price from CLOB.
+    Returns (best_ask, usd_volume). Returns (0.0, 0.0) on failure."""
+    try:
+        resp = await client.get(
+            f"https://clob.polymarket.com/book?token_id={token_id}",
+            timeout=3,
+        )
+        data = resp.json()
+        asks = sorted(data.get("asks", []), key=lambda x: float(x["price"]))
+        if not asks:
+            return 0.0, 0.0
+        best_price = float(asks[0]["price"])
+        vol_tokens = sum(float(a["size"]) for a in asks
+                         if float(a["price"]) <= best_price + 0.01)
+        return best_price, vol_tokens * best_price
+    except Exception:
+        return 0.0, 0.0
+
+
 async def fetch_market_price(client: httpx.AsyncClient, coin: str, period_ts: int) -> dict | None:
     """Fetch current market prices for a coin's period — called fresh at minute 12."""
     slug = f"{coin}-updown-15m-{period_ts}"
@@ -199,7 +222,7 @@ async def fetch_market_price(client: httpx.AsyncClient, coin: str, period_ts: in
 
 async def place_order(loop, clob: ClobClient, token_id: str,
                       entry_price: float, tokens: float) -> str:
-    """Place a GTC buy order. Returns order_id or empty string on failure."""
+    """Place a FAK buy order. Fills immediately or auto-cancels. Returns order_id or ''."""
     try:
         order_args = OrderArgs(
             token_id=token_id,
@@ -209,7 +232,7 @@ async def place_order(loop, clob: ClobClient, token_id: str,
         )
         signed = await loop.run_in_executor(None, clob.create_order, order_args)
         result = await loop.run_in_executor(
-            None, functools.partial(clob.post_order, signed, OrderType.GTC))
+            None, functools.partial(clob.post_order, signed, OrderType.FAK))
         return result.get("orderID", "")
     except Exception as e:
         logger.error("place_order_error", error=str(e)[:120])
@@ -448,6 +471,8 @@ async def main():
                 all_moves     = compute_all_moves(ws_feed, period_prices)
 
                 for coin in COINS:
+                    if coin not in LIQUID_COINS:
+                        continue
                     if coin in fired_this_period:
                         continue
 
@@ -479,9 +504,18 @@ async def main():
                         logger.warning("certainty_no_market", coin=coin)
                         continue
 
-                    side     = "buy_up" if direction == "up" else "buy_down"
+                    side      = "buy_up" if direction == "up" else "buy_down"
+                    token_id  = market["up_token_id"] if direction == "up" else market["down_token_id"]
                     raw_price = market["up_price"] if direction == "up" else market["down_price"]
                     entry_price = round(min(raw_price + 0.01, 0.99), 4)
+
+                    # Gate 4: CLOB book must have enough liquidity to fill
+                    clob_ask, ask_usd_vol = await get_clob_ask(http, token_id)
+                    if ask_usd_vol < MIN_BOOK_VOLUME:
+                        logger.info("certainty_skip_thin_book",
+                                    coin=coin, ask_vol_usd=round(ask_usd_vol, 1))
+                        fired_this_period.add(coin)
+                        continue
 
                     if entry_price > MAX_ENTRY_PRICE:
                         logger.info("certainty_skip",
@@ -490,27 +524,30 @@ async def main():
                         fired_this_period.add(coin)
                         continue
 
-                    token_id = market["up_token_id"] if direction == "up" else market["down_token_id"]
                     size_usd = min(kelly_size(bankroll), bankroll - 5)
                     if size_usd < BET_MIN:
                         continue
 
-                    tokens = size_usd / entry_price
+                    # Cap tokens to available CLOB volume so FAK fills fully
+                    available_tokens = ask_usd_vol / entry_price
+                    tokens = min(size_usd / entry_price, available_tokens)
+                    actual_size = round(tokens * entry_price, 2)
 
                     logger.info("certainty_signal",
                                 coin=coin, direction=direction,
                                 move="%.3f%%" % (move * 100),
                                 entry_price=entry_price,
-                                size_usd=round(size_usd, 2),
+                                size_usd=actual_size,
+                                ask_vol=round(ask_usd_vol, 1),
                                 elapsed=elapsed)
 
                     order_id = await place_order(loop, clob, token_id, entry_price, tokens)
                     if not order_id:
                         continue
 
-                    bankroll -= size_usd
+                    bankroll -= actual_size
                     state["bankroll"]        = bankroll
-                    state["total_invested"]  = state.get("total_invested", 0) + size_usd
+                    state["total_invested"]  = state.get("total_invested", 0) + actual_size
 
                     trade = {
                         "period":       current_period,
@@ -519,7 +556,7 @@ async def main():
                         "token_id":     token_id,
                         "condition_id": market["condition_id"],
                         "entry_price":  entry_price,
-                        "size_usd":     round(size_usd, 2),
+                        "size_usd":     actual_size,
                         "tokens":       round(tokens, 4),
                         "order_id":     order_id,
                         "placed_at":    time.time(),

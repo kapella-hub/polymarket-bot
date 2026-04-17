@@ -52,17 +52,17 @@ COIN_TO_ASSET = {"btc": "BTC", "eth": "ETH", "sol": "SOL",
                  "xrp": "XRP", "doge": "DOGE", "bnb": "BNB"}
 
 # Core parameters
-SNIPE_WINDOW   = 90     # Fire within first N seconds of period start
-MIN_MOVE_PCT   = 0.004  # 0.40% minimum move to signal (stronger conviction)
-SNIPE_PRICE    = 0.62   # Limit entry price (raised to match actual asks at period start)
-CANCEL_AFTER   = 20     # Cancel unfilled orders after N seconds
-BET_PCT        = 0.08   # 8% bankroll per signal
-BET_MIN        = 8.0
-BET_MAX        = 25.0
-MAX_CONCURRENT = 3
-CROSS_BOOST    = 1.5    # Size multiplier when 2+ coins confirm direction
-CIRCUIT_LOSSES = 3      # Consecutive losses before pause
-CIRCUIT_SKIP   = 4      # Periods to skip after trigger
+SNIPE_WINDOW     = 90     # Fire within first N seconds of period start
+MIN_MOVE_PCT     = 0.004  # 0.40% minimum move to signal (stronger conviction)
+MAX_ENTRY_PRICE  = 0.72   # Skip if best ask > this (EV floor: need <73.5% break-even)
+MIN_BOOK_VOLUME  = 20.0   # Min USD resting at best ask before placing
+BET_PCT          = 0.08   # 8% bankroll per signal
+BET_MIN          = 8.0
+BET_MAX          = 25.0
+MAX_CONCURRENT   = 3
+CROSS_BOOST      = 1.5    # Size multiplier when 2+ coins confirm direction
+CIRCUIT_LOSSES   = 3      # Consecutive losses before pause
+CIRCUIT_SKIP     = 4      # Periods to skip after trigger
 
 
 def create_clob():
@@ -142,14 +142,25 @@ async def fetch_all_markets(client: httpx.AsyncClient, period_ts: int) -> dict[s
     }
 
 
-async def cancel_order(loop, clob, order_id: str) -> bool:
-    """Cancel a CLOB order. Returns True on success."""
+async def get_clob_ask(client: httpx.AsyncClient, token_id: str) -> tuple[float, float]:
+    """Fetch best ask price and USD volume resting at that price from CLOB.
+    Returns (best_ask, usd_volume). Returns (0.0, 0.0) on failure."""
     try:
-        await loop.run_in_executor(None, functools.partial(clob.cancel, order_id))
-        return True
-    except Exception as e:
-        logger.debug("cancel_error", order_id=order_id[:16], error=str(e))
-        return False
+        resp = await client.get(
+            f"https://clob.polymarket.com/book?token_id={token_id}",
+            timeout=3,
+        )
+        data = resp.json()
+        asks = sorted(data.get("asks", []), key=lambda x: float(x["price"]))
+        if not asks:
+            return 0.0, 0.0
+        best_price = float(asks[0]["price"])
+        # Aggregate tokens within one cent of best ask
+        vol_tokens = sum(float(a["size"]) for a in asks
+                         if float(a["price"]) <= best_price + 0.01)
+        return best_price, vol_tokens * best_price
+    except Exception:
+        return 0.0, 0.0
 
 
 async def main():
@@ -171,7 +182,8 @@ async def main():
     print("  Duration:     %ds (%.1fh)" % (duration, duration / 3600))
     print("  Bankroll:     $%.2f" % bankroll)
     print("  Snipe window: first %ds of each 15-min period" % SNIPE_WINDOW)
-    print("  Min move:     %.2f%%   Entry: $%.2f   Cancel: %ds" % (MIN_MOVE_PCT * 100, SNIPE_PRICE, CANCEL_AFTER))
+    print("  Min move:     %.2f%%   Max entry: $%.2f   Order: FAK (dynamic price)" % (MIN_MOVE_PCT * 100, MAX_ENTRY_PRICE))
+    print("  Book filter:  min $%.0f resting ask volume before placing" % MIN_BOOK_VOLUME)
     print("  Bet:          %.0f%% of bankroll ($%.0f–$%.0f), max %d concurrent" % (BET_PCT * 100, BET_MIN, BET_MAX, MAX_CONCURRENT))
     print("  Coins:        %s" % ", ".join(c.upper() for c in COINS))
     print()
@@ -314,10 +326,19 @@ async def main():
                             token_id     = market["up_token_id"]   if side == "buy_up"   else market["down_token_id"]
                             market_price = market["up_price"]      if side == "buy_up"   else market["down_price"]
 
-                            # Skip if market has already repriced past our limit
-                            if market_price > SNIPE_PRICE + 0.04:
-                                logger.info("market_already_repriced",
-                                            coin=coin, market_price=market_price)
+                            # Fetch live CLOB ask for dynamic pricing
+                            best_ask, ask_usd_vol = await get_clob_ask(http, token_id)
+
+                            if ask_usd_vol < MIN_BOOK_VOLUME:
+                                logger.debug("sniper_skip_thin_book",
+                                             coin=coin, ask_vol_usd=round(ask_usd_vol, 1))
+                                fired_this_period.add(coin)
+                                continue
+
+                            entry_price = best_ask if best_ask > 0 else market_price
+                            if entry_price > MAX_ENTRY_PRICE:
+                                logger.info("sniper_skip_price_high",
+                                            coin=coin, entry=entry_price)
                                 fired_this_period.add(coin)
                                 continue
 
@@ -328,44 +349,47 @@ async def main():
                                              bankroll=round(bankroll, 2), size=size)
                                 continue
 
-                            tokens = size / SNIPE_PRICE
+                            # Cap tokens to available volume so FAK fills completely
+                            tokens = size / entry_price
+                            available_tokens = ask_usd_vol / entry_price
+                            tokens = min(tokens, available_tokens)
+                            actual_size = round(tokens * entry_price, 2)
 
                             try:
                                 order_args = OrderArgs(
                                     token_id=token_id,
-                                    price=SNIPE_PRICE,
+                                    price=round(entry_price, 4),
                                     size=round(tokens, 2),
                                     side=BUY,
                                 )
                                 signed = await loop.run_in_executor(
                                     None, clob.create_order, order_args)
                                 result = await loop.run_in_executor(
-                                    None, functools.partial(clob.post_order, signed, OrderType.GTC))
+                                    None, functools.partial(clob.post_order, signed, OrderType.FAK))
                                 order_id = result.get("orderID", "")
 
                                 if order_id:
-                                    bankroll -= size
+                                    bankroll -= actual_size
                                     state["bankroll"] = bankroll
-                                    state["total_invested"] = state.get("total_invested", 0) + size
+                                    state["total_invested"] = state.get("total_invested", 0) + actual_size
 
                                     trade = {
-                                        "period":       period_ts,
-                                        "coin":         coin,
-                                        "side":         side,
-                                        "token_id":     token_id,
-                                        "condition_id": market["condition_id"],
-                                        "entry_price":  SNIPE_PRICE,
-                                        "size_usd":     round(size, 2),
-                                        "tokens":       round(tokens, 2),
-                                        "order_id":     order_id,
-                                        "placed_at":    time.time(),
-                                        "cancel_at":    time.time() + CANCEL_AFTER,
-                                        "period_end":   period_ts + 900,
-                                        "move_pct":     round(move * 100, 3),
+                                        "period":        period_ts,
+                                        "coin":          coin,
+                                        "side":          side,
+                                        "token_id":      token_id,
+                                        "condition_id":  market["condition_id"],
+                                        "entry_price":   round(entry_price, 4),
+                                        "size_usd":      actual_size,
+                                        "tokens":        round(tokens, 2),
+                                        "order_id":      order_id,
+                                        "placed_at":     time.time(),
+                                        "period_end":    period_ts + 900,
+                                        "move_pct":      round(move * 100, 3),
                                         "cross_confirm": confirm_count,
-                                        "btc_at_entry": ws_feed.get("BTC"),
-                                        "status":       "placed",
-                                        "pnl":          0,
+                                        "btc_at_entry":  ws_feed.get("BTC"),
+                                        "status":        "placed",
+                                        "pnl":           0,
                                     }
                                     open_trades.append(trade)
                                     state["trades"].append(trade)
@@ -379,11 +403,12 @@ async def main():
                                         side=side,
                                         move="%.3f%%" % (move * 100),
                                         elapsed=elapsed,
-                                        size=round(size, 2),
+                                        size=actual_size,
+                                        entry=round(entry_price, 4),
                                         tokens=round(tokens, 1),
                                         boost=("%.1fx" % boost) if boost > 1 else "1x",
                                         confirm=confirm_count,
-                                        market_price=market_price,
+                                        ask_vol=round(ask_usd_vol, 1),
                                         bankroll=round(bankroll, 2),
                                         order_id=order_id[:16],
                                     )
@@ -395,31 +420,8 @@ async def main():
                                              coin=coin, error=str(e)[:120])
 
             # ──────────────────────────────────────────────────
-            # CANCEL expired unfilled orders
-            # ──────────────────────────────────────────────────
-            now_f = time.time()
-            for trade in list(open_trades):
-                if trade["status"] != "placed":
-                    continue
-                if now_f < trade.get("cancel_at", float("inf")):
-                    continue
-
-                cancelled = await cancel_order(loop, clob, trade["order_id"])
-                if cancelled:
-                    bankroll += trade["size_usd"]
-                    state["bankroll"] = bankroll
-                    trade["status"] = "cancelled"
-                    trade["pnl"]    = 0
-                    save_state(state)
-                    logger.info("SNIPER_CANCELLED",
-                                coin=trade["coin"].upper(),
-                                elapsed_since_place=round(now_f - trade["placed_at"], 1),
-                                order_id=trade["order_id"][:16])
-                else:
-                    trade["cancel_at"] = now_f + 15  # Retry in 15s
-
-            # ──────────────────────────────────────────────────
             # RESOLVE trades (period_end + 120s grace)
+            # (FAK orders are filled-or-cancelled atomically — no manual cancel needed)
             # ──────────────────────────────────────────────────
             for trade in list(open_trades):
                 if trade["status"] != "placed":
@@ -445,7 +447,7 @@ async def main():
                 )
 
                 if won:
-                    payout = trade["tokens"] * 0.90
+                    payout = trade["tokens"] * 0.98  # 2% Polymarket fee
                     trade["pnl"]    = round(payout - trade["size_usd"], 2)
                     trade["status"] = "won"
                     bankroll += payout
