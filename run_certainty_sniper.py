@@ -132,6 +132,7 @@ def load_state() -> dict:
         "total_invested": 0.0,
         "total_returned": 0.0,
         "consecutive_losses": 0,
+        "skip_signals": 0,
         "daily_start_bankroll": 0.0,
         "daily_start_date": "",
     }
@@ -230,7 +231,7 @@ async def main():
 
     clob = create_clob()
     http = httpx.AsyncClient(timeout=10)
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     state = load_state()
     if bankroll_init > 0:
@@ -241,6 +242,7 @@ async def main():
 
     bankroll = state["bankroll"]
     consecutive_losses = state.get("consecutive_losses", 0)
+    skip_signals = state.get("skip_signals", 0)
 
     # Start Binance WebSocket
     ws_feed = BinanceWSFeed()
@@ -262,7 +264,6 @@ async def main():
     hist_start: dict[int, dict[str, float]] = {}
     open_trades: list[dict] = []
     fired_this_period: set[str] = set()
-    skip_signals  = 0
     last_skip_period = 0
     last_check_ts = 0
     last_status   = 0
@@ -281,6 +282,7 @@ async def main():
 
                 if skip_signals > 0 and period_ts != last_skip_period:
                     skip_signals -= 1
+                    state["skip_signals"] = skip_signals
                     last_skip_period = period_ts
                     logger.info("CIRCUIT_BREAKER_TICK", skip_remaining=skip_signals)
 
@@ -500,6 +502,7 @@ async def main():
                     consecutive_losses += 1
                     if consecutive_losses >= CIRCUIT_LOSSES:
                         skip_signals = CIRCUIT_SKIP
+                        state["skip_signals"] = skip_signals
                         logger.warning("CIRCUIT_BREAKER",
                                        consecutive_losses=consecutive_losses,
                                        skipping_next=CIRCUIT_SKIP)
@@ -523,7 +526,23 @@ async def main():
                             win_rate=wr,
                             trades="%dW/%dL" % (wins_total, losses_total))
 
-                open_trades = [t for t in open_trades if t["status"] not in ("won", "lost", "cancelled")]
+            # ── EXPIRE STUCK PENDING_SETTLEMENT TRADES ────────
+            for trade in list(open_trades):
+                if trade["status"] != "pending_settlement":
+                    continue
+                if now_ts <= trade["period_end"] + 300:
+                    continue
+                trade["status"] = "expired"
+                trade["pnl"]    = 0
+                bankroll += trade["size_usd"]
+                state["bankroll"] = bankroll
+                save_state(state)
+                logger.warning("certainty_expired",
+                               coin=trade["coin"].upper(),
+                               size_usd=trade["size_usd"],
+                               reason="no_start_price_after_300s")
+            open_trades = [t for t in open_trades
+                           if t["status"] not in ("won", "lost", "cancelled", "expired")]
 
             await asyncio.sleep(1)
 
