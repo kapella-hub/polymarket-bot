@@ -1,0 +1,1005 @@
+# Certainty Sniper Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Build a late-period (min 12–14) triple-confirmed certainty sniper that bets on near-certain binary outcomes with Half-Kelly compounding, generating daily cashflow from 15-min crypto markets.
+
+**Architecture:** Single async process (`run_certainty_sniper.py`) following the exact pattern of `run_sniper.py`. Watches 6 coins via Binance WebSocket, checks 3 gates at minutes 12–14 of each period, places a GTC market-price order when all pass, resolves 3 minutes later and reinvests. Dashboard API (`src/main.py`) and UI (`dashboard/index.html`) extended with a new card.
+
+**Tech Stack:** Python 3.12+, asyncio, httpx, py-clob-client, structlog, BinanceWSFeed (existing)
+
+---
+
+## File Map
+
+| File | Action | Responsibility |
+|------|--------|----------------|
+| `run_certainty_sniper.py` | CREATE | Main bot — signal logic, order placement, compounding, state |
+| `data/certainty_sniper_state.json` | AUTO-CREATED | Persisted bankroll, trades, circuit state |
+| `certainty_sniper_output.log` | AUTO-CREATED | Structured log consumed by dashboard API |
+| `src/main.py` | MODIFY | Add certainty sniper section to `/api/status` |
+| `dashboard/index.html` | MODIFY | Add certainty sniper card between sniper and power trader |
+| `tests/test_certainty_sniper.py` | CREATE | Unit tests for pure functions |
+
+---
+
+## Task 1: Pure Functions + Tests
+
+**Files:**
+- Create: `run_certainty_sniper.py` (constants + pure functions only)
+- Create: `tests/test_certainty_sniper.py`
+
+- [ ] **Step 1: Create `run_certainty_sniper.py` with constants and pure functions**
+
+```python
+#!/usr/bin/env python3
+"""
+Certainty Sniper — Late-Period Triple-Confirmed Compounder
+
+Strategy: In minutes 12-14 of each 15-min period, when a coin has moved
+>0.7% AND 2+ coins confirm the direction AND Binance order book still shows
+pressure, buy the winning-side token at current market price (~$0.82-0.90).
+Token resolves $1 in <3 minutes. Half-Kelly compounding.
+
+Gates:
+  1. Target coin moved >=0.7% from period open
+  2. >=2 coins moved >=0.5% in same direction (macro signal)
+  3. Binance top-10 order book: bid depth > ask depth (UP) or vice versa
+"""
+
+import asyncio
+import functools
+import json
+import os
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).parent / '.env')
+
+import httpx
+import structlog
+
+from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
+from py_clob_client.order_builder.constants import BUY
+from src.crypto_arb.ws_feeds import BinanceWSFeed
+
+logger = structlog.get_logger()
+
+LOG_FILE   = Path(__file__).parent / "certainty_sniper_output.log"
+STATE_FILE = Path(__file__).parent / "data" / "certainty_sniper_state.json"
+
+COINS         = ["btc", "eth", "sol", "xrp", "doge", "bnb"]
+COIN_TO_ASSET = {"btc": "BTC", "eth": "ETH", "sol": "SOL",
+                 "xrp": "XRP", "doge": "DOGE", "bnb": "BNB"}
+
+# Timing
+CERTAINTY_START  = 720   # 12 min into period — start checking
+CERTAINTY_END    = 840   # 14 min into period — stop (3 min to resolve)
+CHECK_INTERVAL   = 30    # Check every 30s in window
+CANCEL_AFTER     = 20    # Cancel unfilled order after 20s
+
+# Signal thresholds
+MIN_MOVE_PCT       = 0.007  # Gate 1: target coin moved >=0.7%
+CONFIRM_MOVE_PCT   = 0.005  # Gate 2: confirming coins moved >=0.5%
+MIN_CONFIRMING     = 2      # Gate 2: need >=2 confirming coins
+MAX_ENTRY_PRICE    = 0.92   # Skip if market already priced certainty in
+
+# Sizing
+HALF_KELLY_PCT = 0.23   # Half-Kelly at 90% estimated win rate
+BET_MIN        = 8.0
+BET_MAX        = 40.0
+
+# Risk controls
+CIRCUIT_LOSSES    = 2     # Consecutive losses before pause
+CIRCUIT_SKIP      = 4     # Periods to skip after circuit triggers
+DAILY_LOSS_PCT    = 0.12  # 12% daily loss → halt for 24h
+MIN_BANKROLL      = 30.0  # Stop trading below this
+
+
+def kelly_size(bankroll: float, win_rate: float = 0.90, avg_entry: float = 0.85) -> float:
+    """Half-Kelly bet size. Returns dollars to risk."""
+    b = (1.0 - avg_entry) / avg_entry  # net return per dollar at avg_entry
+    kelly = (win_rate * b - (1.0 - win_rate)) / b
+    size = bankroll * (kelly / 2.0)
+    return min(BET_MAX, max(BET_MIN, round(size, 2)))
+
+
+def gate1_move(cur: float, start: float) -> tuple[bool, float]:
+    """Gate 1: coin moved >=MIN_MOVE_PCT from period open. Returns (passed, move_fraction)."""
+    if not cur or not start:
+        return False, 0.0
+    move = (cur - start) / start
+    return abs(move) >= MIN_MOVE_PCT, move
+
+
+def gate2_confirm(all_moves: dict[str, float], target_direction: str) -> bool:
+    """Gate 2: >=MIN_CONFIRMING coins moved >=CONFIRM_MOVE_PCT in same direction."""
+    if target_direction == "up":
+        confirming = sum(1 for m in all_moves.values() if m >= CONFIRM_MOVE_PCT)
+    else:
+        confirming = sum(1 for m in all_moves.values() if m <= -CONFIRM_MOVE_PCT)
+    return confirming >= MIN_CONFIRMING
+
+
+def compute_all_moves(ws_feed: BinanceWSFeed, period_prices: dict[str, float]) -> dict[str, float]:
+    """Compute move fraction for each coin from period open. Returns {coin: move_fraction}."""
+    moves = {}
+    for coin, asset in COIN_TO_ASSET.items():
+        cur   = ws_feed.get(asset)
+        start = period_prices.get(asset)
+        if cur and start:
+            moves[coin] = (cur - start) / start
+    return moves
+```
+
+- [ ] **Step 2: Create `tests/test_certainty_sniper.py`**
+
+```python
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from run_certainty_sniper import (
+    kelly_size, gate1_move, gate2_confirm, compute_all_moves,
+    MIN_MOVE_PCT, CONFIRM_MOVE_PCT, MIN_CONFIRMING,
+    BET_MIN, BET_MAX,
+)
+
+
+def test_kelly_size_typical():
+    size = kelly_size(bankroll=151.25)
+    assert BET_MIN <= size <= BET_MAX
+
+
+def test_kelly_size_small_bankroll():
+    size = kelly_size(bankroll=35.0)
+    assert size == BET_MIN  # floor at $8
+
+
+def test_kelly_size_large_bankroll():
+    size = kelly_size(bankroll=500.0)
+    assert size == BET_MAX  # cap at $40
+
+
+def test_gate1_move_passes():
+    passed, move = gate1_move(cur=101.0, start=100.0)
+    assert passed is True
+    assert abs(move - 0.01) < 1e-9
+
+
+def test_gate1_move_fails_small():
+    passed, move = gate1_move(cur=100.3, start=100.0)
+    assert passed is False  # 0.3% < 0.7%
+
+
+def test_gate1_move_missing_price():
+    passed, move = gate1_move(cur=0, start=100.0)
+    assert passed is False
+
+
+def test_gate2_confirm_up_passes():
+    moves = {"btc": 0.008, "eth": 0.006, "sol": -0.002, "xrp": 0.003, "doge": 0.001, "bnb": 0.007}
+    assert gate2_confirm(moves, "up") is True  # btc, eth, bnb all >=0.5% up
+
+
+def test_gate2_confirm_up_fails():
+    moves = {"btc": 0.008, "eth": 0.002, "sol": -0.002, "xrp": 0.001, "doge": 0.001, "bnb": 0.003}
+    assert gate2_confirm(moves, "up") is False  # only btc >=0.5% up
+
+
+def test_gate2_confirm_down_passes():
+    moves = {"btc": -0.009, "eth": -0.006, "sol": 0.001, "xrp": -0.005, "doge": 0.001, "bnb": 0.002}
+    assert gate2_confirm(moves, "down") is True
+
+
+class FakeWSFeed:
+    def __init__(self, prices):
+        self._prices = prices
+    def get(self, asset):
+        return self._prices.get(asset)
+
+
+def test_compute_all_moves():
+    feed = FakeWSFeed({"BTC": 76000.0, "ETH": 2400.0, "SOL": 130.0,
+                       "XRP": 0.60, "DOGE": 0.15, "BNB": 600.0})
+    period_prices = {"BTC": 75000.0, "ETH": 2400.0, "SOL": 130.0,
+                     "XRP": 0.60, "DOGE": 0.15, "BNB": 600.0}
+    moves = compute_all_moves(feed, period_prices)
+    assert abs(moves["btc"] - 0.01333) < 0.001  # BTC up ~1.33%
+    assert moves["eth"] == 0.0  # ETH flat
+
+
+def test_compute_all_moves_missing_price():
+    feed = FakeWSFeed({"BTC": 76000.0})  # only BTC
+    period_prices = {"BTC": 75000.0, "ETH": 2400.0}
+    moves = compute_all_moves(feed, period_prices)
+    assert "btc" in moves
+    assert "eth" not in moves  # skipped — no current price
+```
+
+- [ ] **Step 3: Run tests**
+
+```bash
+cd E:\Documents\Projects\polymarket-bot
+python -m pytest tests/test_certainty_sniper.py -v
+```
+
+Expected: all 11 tests PASS.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add run_certainty_sniper.py tests/test_certainty_sniper.py
+git commit -m "feat: certainty sniper — constants, pure functions, unit tests"
+```
+
+---
+
+## Task 2: Async Helpers (order book, market fetch, CLOB)
+
+**Files:**
+- Modify: `run_certainty_sniper.py` (append after pure functions)
+
+- [ ] **Step 1: Add async helpers to `run_certainty_sniper.py`**
+
+Append after `compute_all_moves`:
+
+```python
+def create_clob() -> ClobClient:
+    creds = ApiCreds(
+        api_key=os.getenv('PM_POLYMARKET_API_KEY'),
+        api_secret=os.getenv('PM_POLYMARKET_API_SECRET'),
+        api_passphrase=os.getenv('PM_POLYMARKET_API_PASSPHRASE'),
+    )
+    clob = ClobClient(
+        'https://clob.polymarket.com',
+        key=os.getenv('PM_POLYMARKET_WALLET_PRIVATE_KEY'),
+        chain_id=137, signature_type=0,
+    )
+    clob.set_api_creds(creds)
+    return clob
+
+
+def load_state() -> dict:
+    if STATE_FILE.exists():
+        return json.loads(STATE_FILE.read_text())
+    return {
+        "bankroll": 0.0,
+        "trades": [],
+        "total_invested": 0.0,
+        "total_returned": 0.0,
+        "consecutive_losses": 0,
+        "daily_start_bankroll": 0.0,
+        "daily_start_date": "",
+    }
+
+
+def save_state(state: dict) -> None:
+    STATE_FILE.parent.mkdir(exist_ok=True)
+    STATE_FILE.write_text(json.dumps(state, indent=2))
+
+
+async def gate3_orderbook(client: httpx.AsyncClient, coin: str, direction: str) -> bool:
+    """Gate 3: Binance top-10 order book confirms continued pressure in direction.
+    UP move: bid volume > ask volume. DOWN move: ask volume > bid volume."""
+    symbol = COIN_TO_ASSET[coin] + "USDT"
+    try:
+        resp = await client.get(
+            f"https://api.binance.com/api/v3/depth?symbol={symbol}&limit=10",
+            timeout=3,
+        )
+        data = resp.json()
+        bid_vol = sum(float(qty) for _, qty in data.get("bids", []))
+        ask_vol = sum(float(qty) for _, qty in data.get("asks", []))
+        if direction == "up":
+            return bid_vol > ask_vol
+        else:
+            return ask_vol > bid_vol
+    except Exception as e:
+        logger.debug("orderbook_error", coin=coin, error=str(e))
+        return False  # fail safe: skip if can't check
+
+
+async def fetch_market_price(client: httpx.AsyncClient, coin: str, period_ts: int) -> dict | None:
+    """Fetch current market prices for a coin's period — called fresh at minute 12."""
+    slug = f"{coin}-updown-15m-{period_ts}"
+    try:
+        resp = await client.get(
+            f"https://gamma-api.polymarket.com/markets?slug={slug}",
+            timeout=8,
+        )
+        data = resp.json()
+        if not data:
+            return None
+        m = data[0]
+        tokens   = json.loads(m["clobTokenIds"])  if isinstance(m.get("clobTokenIds"), str) else m.get("clobTokenIds", [])
+        outcomes = json.loads(m["outcomes"])       if isinstance(m.get("outcomes"), str)      else m.get("outcomes", [])
+        prices   = json.loads(m["outcomePrices"])  if isinstance(m.get("outcomePrices"), str) else m.get("outcomePrices", [])
+        if len(tokens) < 2 or len(outcomes) < 2:
+            return None
+        up_idx   = next((i for i, o in enumerate(outcomes) if o.lower() == "up"),   0)
+        down_idx = next((i for i, o in enumerate(outcomes) if o.lower() == "down"), 1)
+        return {
+            "coin":          coin,
+            "condition_id":  m.get("conditionId", ""),
+            "up_token_id":   str(tokens[up_idx]),
+            "down_token_id": str(tokens[down_idx]),
+            "up_price":      float(prices[up_idx]),
+            "down_price":    float(prices[down_idx]),
+        }
+    except Exception as e:
+        logger.debug("fetch_market_price_error", coin=coin, error=str(e))
+        return None
+
+
+async def place_order(loop, clob: ClobClient, token_id: str,
+                      entry_price: float, tokens: float) -> str:
+    """Place a GTC buy order. Returns order_id or empty string on failure."""
+    try:
+        order_args = OrderArgs(
+            token_id=token_id,
+            price=round(entry_price, 4),
+            size=round(tokens, 2),
+            side=BUY,
+        )
+        signed = await loop.run_in_executor(None, clob.create_order, order_args)
+        result = await loop.run_in_executor(
+            None, functools.partial(clob.post_order, signed, OrderType.GTC))
+        return result.get("orderID", "")
+    except Exception as e:
+        logger.error("place_order_error", error=str(e)[:120])
+        return ""
+
+
+async def cancel_order(loop, clob: ClobClient, order_id: str) -> bool:
+    try:
+        await loop.run_in_executor(None, functools.partial(clob.cancel, order_id))
+        return True
+    except Exception as e:
+        logger.debug("cancel_error", order_id=order_id[:16], error=str(e))
+        return False
+```
+
+- [ ] **Step 2: Commit**
+
+```bash
+git add run_certainty_sniper.py
+git commit -m "feat: certainty sniper — async helpers (orderbook, market fetch, CLOB)"
+```
+
+---
+
+## Task 3: Main Loop
+
+**Files:**
+- Modify: `run_certainty_sniper.py` (append `main()` function)
+
+- [ ] **Step 1: Append `main()` to `run_certainty_sniper.py`**
+
+```python
+async def main():
+    duration      = int(sys.argv[1])   if len(sys.argv) > 1 else 604800  # 7 days
+    bankroll_init = float(sys.argv[2]) if len(sys.argv) > 2 else 0.0
+
+    clob = create_clob()
+    http = httpx.AsyncClient(timeout=10)
+    loop = asyncio.get_event_loop()
+
+    state = load_state()
+    if bankroll_init > 0:
+        state["bankroll"] = bankroll_init
+        state["daily_start_bankroll"] = bankroll_init
+        state["daily_start_date"] = datetime.now(timezone.utc).date().isoformat()
+        save_state(state)
+
+    bankroll = state["bankroll"]
+    consecutive_losses = state.get("consecutive_losses", 0)
+
+    # Start Binance WebSocket
+    ws_feed = BinanceWSFeed()
+    ws_task = asyncio.create_task(ws_feed.run())
+
+    for _ in range(100):
+        if ws_feed.get("BTC"):
+            break
+        await asyncio.sleep(0.1)
+
+    if not ws_feed.get("BTC"):
+        logger.error("no_btc_price_timeout")
+        return
+
+    logger.info("certainty_sniper_ready",
+                btc=ws_feed.get("BTC"), bankroll=round(bankroll, 2))
+
+    current_period     = 0
+    hist_start: dict[int, dict[str, float]] = {}
+    open_trades: list[dict] = []
+    fired_this_period: set[str] = set()
+    skip_signals  = 0
+    last_skip_period = 0
+    last_check_ts = 0    # last time we ran the certainty check
+    last_status   = 0
+    start_time    = time.time()
+
+    try:
+        while time.time() - start_time < duration:
+            now_ts    = int(time.time())
+            period_ts = (now_ts // 900) * 900
+            elapsed   = now_ts - period_ts
+
+            # ── NEW PERIOD ────────────────────────────────────
+            if period_ts != current_period:
+                fired_this_period.clear()
+                last_check_ts = 0
+
+                if skip_signals > 0 and period_ts != last_skip_period:
+                    skip_signals -= 1
+                    last_skip_period = period_ts
+                    logger.info("CIRCUIT_BREAKER_TICK", skip_remaining=skip_signals)
+
+                # Record period-start prices
+                hist_start[period_ts] = {
+                    asset: ws_feed.get(asset)
+                    for asset in COIN_TO_ASSET.values()
+                    if ws_feed.get(asset)
+                }
+                # Prune old history
+                cutoff = period_ts - 4 * 900
+                for old_ts in [k for k in list(hist_start) if k < cutoff]:
+                    del hist_start[old_ts]
+
+                current_period = period_ts
+
+                # Reset daily loss tracking at start of new UTC day
+                today = datetime.now(timezone.utc).date().isoformat()
+                if state.get("daily_start_date") != today:
+                    state["daily_start_bankroll"] = bankroll
+                    state["daily_start_date"] = today
+                    save_state(state)
+
+            # ── STATUS HEARTBEAT (every 60s) ──────────────────
+            if now_ts - last_status >= 60:
+                wins   = sum(1 for t in state["trades"] if t.get("status") == "won")
+                losses = sum(1 for t in state["trades"] if t.get("status") == "lost")
+                total  = wins + losses
+                wr     = ("%.0f%%" % (wins / total * 100)) if total else "--"
+                pnl    = sum(t.get("pnl", 0) for t in state["trades"])
+                logger.info("certainty_status",
+                            bankroll=round(bankroll, 2),
+                            btc=ws_feed.get("BTC"),
+                            open=sum(1 for t in open_trades if t["status"] == "placed"),
+                            trades="%dW/%dL" % (wins, losses),
+                            win_rate=wr,
+                            pnl=round(pnl, 2),
+                            period_elapsed="%ds" % elapsed,
+                            circuit="skip%d" % skip_signals if skip_signals else "ok")
+                last_status = now_ts
+
+            # ── DAILY LOSS LIMIT ──────────────────────────────
+            daily_start = state.get("daily_start_bankroll", bankroll)
+            if daily_start > 0 and (daily_start - bankroll) / daily_start >= DAILY_LOSS_PCT:
+                logger.warning("daily_loss_limit_hit",
+                               start=round(daily_start, 2), now=round(bankroll, 2))
+                await asyncio.sleep(300)
+                continue
+
+            # ── MIN BANKROLL ──────────────────────────────────
+            if bankroll < MIN_BANKROLL:
+                logger.warning("bankroll_too_low", bankroll=round(bankroll, 2))
+                await asyncio.sleep(60)
+                continue
+
+            # ── CERTAINTY WINDOW: minutes 12–14 ──────────────
+            in_window = CERTAINTY_START <= elapsed <= CERTAINTY_END
+            check_due = (now_ts - last_check_ts) >= CHECK_INTERVAL
+
+            if in_window and check_due and skip_signals == 0:
+                last_check_ts = now_ts
+                period_prices = hist_start.get(current_period, {})
+                all_moves     = compute_all_moves(ws_feed, period_prices)
+
+                for coin in COINS:
+                    if coin in fired_this_period:
+                        continue
+
+                    move = all_moves.get(coin, 0.0)
+                    passed_g1, _ = gate1_move(
+                        cur=ws_feed.get(COIN_TO_ASSET[coin]),
+                        start=period_prices.get(COIN_TO_ASSET[coin]),
+                    )
+                    if not passed_g1:
+                        continue
+
+                    direction = "up" if move > 0 else "down"
+                    if not gate2_confirm(all_moves, direction):
+                        continue
+
+                    # Gate 3 — order book (async, with timeout guard)
+                    try:
+                        ob_ok = await asyncio.wait_for(
+                            gate3_orderbook(http, coin, direction), timeout=3)
+                    except asyncio.TimeoutError:
+                        ob_ok = False
+                    if not ob_ok:
+                        logger.debug("certainty_skip_gate3", coin=coin, move="%.3f%%" % (move * 100))
+                        continue
+
+                    # All 3 gates passed — fetch fresh market price
+                    market = await fetch_market_price(http, coin, current_period)
+                    if not market:
+                        logger.warning("certainty_no_market", coin=coin)
+                        continue
+
+                    side     = "buy_up" if direction == "up" else "buy_down"
+                    raw_price = market["up_price"] if direction == "up" else market["down_price"]
+                    entry_price = round(min(raw_price + 0.01, 0.99), 4)  # +1c buffer
+
+                    if entry_price > MAX_ENTRY_PRICE:
+                        logger.info("certainty_skip",
+                                    reason="entry_too_high",
+                                    coin=coin, price=entry_price)
+                        fired_this_period.add(coin)
+                        continue
+
+                    token_id = market["up_token_id"] if direction == "up" else market["down_token_id"]
+                    size_usd = min(kelly_size(bankroll), bankroll - 5)
+                    if size_usd < BET_MIN:
+                        continue
+
+                    tokens = size_usd / entry_price
+
+                    logger.info("certainty_signal",
+                                coin=coin, direction=direction,
+                                move="%.3f%%" % (move * 100),
+                                entry_price=entry_price,
+                                size_usd=round(size_usd, 2),
+                                elapsed=elapsed)
+
+                    order_id = await place_order(loop, clob, token_id, entry_price, tokens)
+                    if not order_id:
+                        continue
+
+                    bankroll -= size_usd
+                    state["bankroll"]        = bankroll
+                    state["total_invested"]  = state.get("total_invested", 0) + size_usd
+
+                    trade = {
+                        "period":       current_period,
+                        "coin":         coin,
+                        "side":         side,
+                        "token_id":     token_id,
+                        "condition_id": market["condition_id"],
+                        "entry_price":  entry_price,
+                        "size_usd":     round(size_usd, 2),
+                        "tokens":       round(tokens, 4),
+                        "order_id":     order_id,
+                        "placed_at":    time.time(),
+                        "cancel_at":    time.time() + CANCEL_AFTER,
+                        "period_end":   current_period + 900,
+                        "move_pct":     round(move * 100, 3),
+                        "btc_at_entry": ws_feed.get("BTC"),
+                        "status":       "placed",
+                        "pnl":          0,
+                    }
+                    open_trades.append(trade)
+                    state["trades"].append(trade)
+                    fired_this_period.add(coin)
+                    save_state(state)
+
+                    logger.info("CERTAINTY_TRADE",
+                                coin=coin.upper(), side=side,
+                                move="%.3f%%" % (move * 100),
+                                entry_price=entry_price,
+                                size_usd=round(size_usd, 2),
+                                tokens=round(tokens, 2),
+                                elapsed=elapsed,
+                                bankroll=round(bankroll, 2),
+                                order_id=order_id[:16])
+
+            # ── CANCEL UNFILLED ORDERS ────────────────────────
+            now_f = time.time()
+            for trade in list(open_trades):
+                if trade["status"] != "placed":
+                    continue
+                if now_f < trade.get("cancel_at", float("inf")):
+                    continue
+                cancelled = await cancel_order(loop, clob, trade["order_id"])
+                if cancelled:
+                    bankroll += trade["size_usd"]
+                    state["bankroll"] = bankroll
+                    trade["status"] = "cancelled"
+                    trade["pnl"]    = 0
+                    save_state(state)
+                    logger.info("CERTAINTY_CANCELLED",
+                                coin=trade["coin"].upper(),
+                                order_id=trade["order_id"][:16])
+                else:
+                    trade["cancel_at"] = now_f + 15
+
+            # ── RESOLVE TRADES (period_end + 120s grace) ──────
+            for trade in list(open_trades):
+                if trade["status"] != "placed":
+                    continue
+                if now_ts <= trade["period_end"] + 120:
+                    continue
+
+                coin  = trade["coin"]
+                asset = COIN_TO_ASSET[coin]
+                t_per = trade["period"]
+
+                start_p = hist_start.get(t_per, {}).get(asset)
+                end_p   = ws_feed.get(asset)
+
+                if not start_p:
+                    trade["status"] = "pending_settlement"
+                    continue
+
+                actual_move = ((end_p - start_p) / start_p) if end_p else 0
+                won = (
+                    (trade["side"] == "buy_up"   and actual_move > 0) or
+                    (trade["side"] == "buy_down"  and actual_move < 0)
+                )
+
+                if won:
+                    payout = trade["tokens"] * 0.98  # 2% Polymarket fee
+                    trade["pnl"]    = round(payout - trade["size_usd"], 2)
+                    trade["status"] = "won"
+                    bankroll += payout
+                    state["total_returned"] = state.get("total_returned", 0) + payout
+                    consecutive_losses = 0
+                else:
+                    trade["pnl"]    = -trade["size_usd"]
+                    trade["status"] = "lost"
+                    consecutive_losses += 1
+                    if consecutive_losses >= CIRCUIT_LOSSES:
+                        skip_signals = CIRCUIT_SKIP
+                        logger.warning("CIRCUIT_BREAKER",
+                                       consecutive_losses=consecutive_losses,
+                                       skipping_next=CIRCUIT_SKIP)
+                        consecutive_losses = 0
+
+                state["bankroll"]        = bankroll
+                state["consecutive_losses"] = consecutive_losses
+                save_state(state)
+
+                wins_total   = sum(1 for t in state["trades"] if t.get("status") == "won")
+                losses_total = sum(1 for t in state["trades"] if t.get("status") == "lost")
+                total_t      = wins_total + losses_total
+                wr           = ("%.0f%%" % (wins_total / total_t * 100)) if total_t else "--"
+
+                logger.info("CERTAINTY_RESOLVED",
+                            coin=coin.upper(),
+                            side=trade["side"],
+                            won=won,
+                            pnl=trade["pnl"],
+                            bankroll=round(bankroll, 2),
+                            win_rate=wr,
+                            trades="%dW/%dL" % (wins_total, losses_total))
+
+                open_trades = [t for t in open_trades if t["status"] not in ("won", "lost", "cancelled")]
+
+            await asyncio.sleep(1)
+
+    finally:
+        ws_task.cancel()
+        await http.aclose()
+        save_state(state)
+        logger.info("certainty_sniper_stopped", bankroll=round(bankroll, 2))
+
+
+if __name__ == "__main__":
+    import logging
+    logging.basicConfig(
+        handlers=[
+            logging.FileHandler(LOG_FILE, mode='a'),
+            logging.StreamHandler(),
+        ],
+        format="%(message)s",
+        level=logging.DEBUG,
+    )
+    structlog.configure(
+        processors=[
+            structlog.stdlib.add_log_level,
+            structlog.stdlib.PositionalArgumentsFormatter(),
+            structlog.dev.ConsoleRenderer(colors=False),
+        ],
+        logger_factory=structlog.stdlib.LoggerFactory(),
+    )
+    asyncio.run(main())
+```
+
+- [ ] **Step 2: Verify the file runs without import errors**
+
+```bash
+cd E:\Documents\Projects\polymarket-bot
+python -c "import run_certainty_sniper; print('imports ok')"
+```
+
+Expected output: `imports ok`
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add run_certainty_sniper.py
+git commit -m "feat: certainty sniper — main loop with 3-gate signal, Kelly sizing, compounding"
+```
+
+---
+
+## Task 4: Dashboard API Integration
+
+**Files:**
+- Modify: `src/main.py` (add certainty sniper section after the momentum sniper section)
+
+- [ ] **Step 1: Read the current state of `src/main.py` around line 618**
+
+Check line 618–626 (after existing sniper section ends). You should see:
+
+```python
+        except Exception:
+            pass
+
+    # --- Power trader (state file + live log) ---
+```
+
+- [ ] **Step 2: Insert certainty sniper API section between sniper and power trader**
+
+In `src/main.py`, find and replace:
+
+```python
+    # --- Power trader (state file + live log) ---
+```
+
+Replace with:
+
+```python
+    # --- Certainty Sniper bot ---
+    cslog = base / "certainty_sniper_output.log"
+    if cslog.exists():
+        try:
+            lines = cslog.read_text().strip().split("\n")
+            cs_trades = []
+            cs_resolved = []
+            cs_latest = {}
+            cs_cancelled_ids: set = set()
+            for line in lines[-1000:]:
+                if "certainty_status" in line:
+                    cs_latest = _parse(line)
+                elif "CERTAINTY_TRADE" in line:
+                    cs_trades.append(_parse(line))
+                elif "CERTAINTY_CANCELLED" in line:
+                    p = _parse(line)
+                    cs_cancelled_ids.add(p.get("order_id", ""))
+                elif "CERTAINTY_RESOLVED" in line:
+                    cs_resolved.append(_parse(line))
+            for t in cs_trades:
+                t["status"] = "cancelled" if t.get("order_id", "") in cs_cancelled_ids else "open"
+
+            cs_bankroll = float(cs_latest.get("bankroll", "0").replace("$", ""))
+            cs_pnl = float(cs_latest.get("pnl", "0").replace("$", "").replace("+", ""))
+            cs_tr = cs_latest.get("trades", "0W/0L")
+            cs_wins = int(cs_tr.split("W")[0]) if "W" in cs_tr else 0
+            cs_losses = int(cs_tr.split("/")[1].replace("L", "")) if "/" in cs_tr else 0
+            result["certainty_sniper"] = {
+                "bankroll": cs_bankroll,
+                "pnl": cs_pnl,
+                "wins": cs_wins,
+                "losses": cs_losses,
+                "win_rate": cs_latest.get("win_rate", "--"),
+                "open": int(cs_latest.get("open", "0")),
+                "btc": float(cs_latest.get("btc", "0")),
+                "period_elapsed": cs_latest.get("period_elapsed", ""),
+                "circuit": cs_latest.get("circuit", "ok"),
+                "recent_trades": cs_trades[-10:],
+                "recent_resolved": cs_resolved[-10:],
+            }
+        except Exception:
+            pass
+
+    # --- Power trader (state file + live log) ---
+```
+
+- [ ] **Step 3: Add default certainty_sniper to result dict**
+
+In `src/main.py`, find the `result = {` initialization block (around line 554). Add `"certainty_sniper"` default:
+
+```python
+    result = {
+        "sniper": {"bankroll": 0, "pnl": 0, "trades": 0, "wins": 0, "losses": 0,
+                   "win_rate": "--", "open": 0, "btc": 0, "period_elapsed": "",
+                   "circuit": "ok", "recent_trades": [], "recent_resolved": []},
+        "certainty_sniper": {"bankroll": 0, "pnl": 0, "wins": 0, "losses": 0,
+                             "win_rate": "--", "open": 0, "btc": 0, "period_elapsed": "",
+                             "circuit": "ok", "recent_trades": [], "recent_resolved": []},
+        "power_trader": {"bankroll": 0, "positions": [], "total_invested": 0},
+        "wallet_usdc": 0,
+        "ai_monitor": {"status": "none", "summary": "", "issues": "", "timestamp": ""},
+    }
+```
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add src/main.py
+git commit -m "feat: certainty sniper — dashboard API integration"
+```
+
+---
+
+## Task 5: Dashboard UI Card
+
+**Files:**
+- Modify: `dashboard/index.html`
+
+- [ ] **Step 1: Find insertion point**
+
+In `dashboard/index.html`, find the line:
+
+```javascript
+  // ── Recent sniper fires ───────────────────────
+```
+
+The certainty sniper card goes BEFORE the momentum sniper section (search for `const snLiveSection`).
+
+- [ ] **Step 2: Add certainty sniper card**
+
+Find in `dashboard/index.html`:
+
+```javascript
+  const snLiveSection = el('div', 'section');
+```
+
+Insert BEFORE that line:
+
+```javascript
+  // ── Certainty Sniper ──────────────────────────
+  const cs = data.certainty_sniper || {};
+  if (cs.bankroll > 0 || (cs.recent_trades||[]).length) {
+    const csSection = el('div', 'section');
+    csSection.append(el('div', 'section-title', 'Certainty Sniper — Late-Period'));
+    const csCard = el('div', 'card');
+
+    let csStatusBadge;
+    const csElapsed = parseInt(cs.period_elapsed||'0');
+    if (csElapsed >= 720 && csElapsed <= 840)
+      csStatusBadge = badge('Certainty Window (' + csElapsed + 's)', 'badge-amber');
+    else if ((cs.circuit||'ok') !== 'ok')
+      csStatusBadge = badge('Circuit Open — ' + cs.circuit, 'badge-red');
+    else
+      csStatusBadge = badge('Watching · next window at 12min', 'badge-blue');
+
+    const csBkEl = el('span');
+    const csTrades = (cs.wins||0) + (cs.losses||0);
+    csBkEl.textContent = usd(cs.bankroll) + '  ·  ' + csTrades + 'W/' + (cs.losses||0) + 'L  ·  P&L ' + (cs.pnl >= 0 ? '+' : '') + usd(cs.pnl||0) + '  ·  win ' + (cs.win_rate||'--');
+    csCard.append(kvRow('Status', csStatusBadge));
+    csCard.append(kvRow('Bankroll', csBkEl));
+    csSection.append(csCard);
+
+    const csRecentFires = (cs.recent_trades||[]).slice(-5);
+    if (csRecentFires.length) {
+      const csFireSection = el('div', 'section');
+      csFireSection.append(el('div', 'section-title', 'Recent Certainty Orders'));
+      for (const t of csRecentFires.slice().reverse()) {
+        const item = el('div', 'pos-item');
+        const left = el('div', 'pos-left');
+        left.append(el('div', 'pos-name', (t.coin||'?').toUpperCase() + ' ' + (t.side||'')));
+        left.append(el('div', 'pos-detail',
+          'move ' + (t.move||'?') + ' · entry ' + usd(parseFloat(t.entry_price||0)) + ' · size ' + usd(parseFloat(t.size_usd||0))));
+        item.append(left);
+        item.append(t.status === 'cancelled' ? badge('Cancelled', 'badge-grey') : badge('Placed', 'badge-amber'));
+        csFireSection.append(item);
+      }
+      app.append(csSection);
+      app.append(csFireSection);
+    } else {
+      app.append(csSection);
+    }
+
+    const csResolved = (cs.recent_resolved||[]).slice(-8);
+    if (csResolved.length) {
+      const csHistSection = el('div', 'section');
+      csHistSection.append(el('div', 'section-title', 'Certainty Trade History'));
+      for (const t of csResolved.slice().reverse()) {
+        const won = t.won === 'True' || t.won === true;
+        const item = el('div', 'pos-item');
+        const left = el('div', 'pos-left');
+        left.append(el('div', 'pos-name', (t.coin||'?').toUpperCase() + ' ' + (t.side||'')));
+        left.append(el('div', 'pos-detail', 'pnl ' + (won ? '+' : '') + usd(parseFloat(t.pnl||0))));
+        item.append(left);
+        item.append(badge(won ? 'Won' : 'Lost', won ? 'badge-green' : 'badge-red'));
+        csHistSection.append(item);
+      }
+      app.append(csHistSection);
+    }
+  }
+
+```
+
+- [ ] **Step 3: Verify `badge-red` and `badge-green` exist**
+
+In `dashboard/index.html`, search for `.badge-green` and `.badge-red`. If missing, add to the CSS block alongside `.badge-grey`:
+
+```css
+  .badge-green { background: rgba(34,197,94,0.15); color: #22c55e; }
+  .badge-red   { background: rgba(239,68,68,0.15);  color: #ef4444; }
+```
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add dashboard/index.html
+git commit -m "feat: certainty sniper — dashboard UI card with status, orders, trade history"
+```
+
+---
+
+## Task 6: Deploy and Launch
+
+**Files:** None new — deploy to server and start bot.
+
+- [ ] **Step 1: Deploy changed files to production**
+
+```bash
+scp run_certainty_sniper.py root@72.62.78.141:/opt/polymarket-bot/run_certainty_sniper.py
+scp src/main.py root@72.62.78.141:/opt/polymarket-bot/src/main.py
+scp dashboard/index.html root@72.62.78.141:/opt/polymarket-bot/dashboard/index.html
+```
+
+- [ ] **Step 2: Restart dashboard**
+
+```bash
+ssh root@72.62.78.141 "systemctl restart polymarket-dashboard && systemctl is-active polymarket-dashboard"
+```
+
+Expected: `active`
+
+- [ ] **Step 3: Start certainty sniper with current bankroll**
+
+```bash
+ssh root@72.62.78.141 "
+cd /opt/polymarket-bot
+nohup venv/bin/python3 -u run_certainty_sniper.py 604800 50.0 >> certainty_sniper_output.log 2>&1 &
+echo \"PID: \$!\"
+"
+```
+
+Start with $50 bankroll (half the sniper's $151.25) to validate the strategy before committing full capital.
+
+- [ ] **Step 4: Verify startup**
+
+```bash
+ssh root@72.62.78.141 "sleep 4 && tail -8 /opt/polymarket-bot/certainty_sniper_output.log"
+```
+
+Expected: logs showing `certainty_sniper_ready`, `btc=...`, `bankroll=50.0`
+
+- [ ] **Step 5: Watch first certainty window (wait until minute 12 of a period)**
+
+```bash
+ssh root@72.62.78.141 "tail -f /opt/polymarket-bot/certainty_sniper_output.log"
+```
+
+Watch for `certainty_status` with `period_elapsed=720s+`. If a signal fires you'll see `certainty_signal` followed by `CERTAINTY_TRADE`.
+
+- [ ] **Step 6: Commit final state**
+
+```bash
+git add run_certainty_sniper.py src/main.py dashboard/index.html
+git commit -m "deploy: certainty sniper live on production with $50 trial bankroll"
+```
+
+---
+
+## Validation Checklist (after 48h live)
+
+- [ ] At least 5 resolved trades — check win rate
+- [ ] If win rate > 80%: increase bankroll to full $151.25, keep Kelly at 23%
+- [ ] If win rate 65-80%: recalculate Kelly: `(p*b - q)/b / 2` with actual numbers, adjust `HALF_KELLY_PCT`
+- [ ] If win rate < 65%: pause bot, review gate thresholds — increase `MIN_MOVE_PCT` to 1.0%
+- [ ] Check average entry price actually achieved — adjust `MAX_ENTRY_PRICE` if needed
