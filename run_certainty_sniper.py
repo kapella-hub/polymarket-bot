@@ -103,3 +103,118 @@ def compute_all_moves(ws_feed: BinanceWSFeed, period_prices: dict[str, float]) -
         if cur and start:
             moves[coin] = (cur - start) / start
     return moves
+
+
+def create_clob() -> ClobClient:
+    creds = ApiCreds(
+        api_key=os.getenv('PM_POLYMARKET_API_KEY'),
+        api_secret=os.getenv('PM_POLYMARKET_API_SECRET'),
+        api_passphrase=os.getenv('PM_POLYMARKET_API_PASSPHRASE'),
+    )
+    clob = ClobClient(
+        'https://clob.polymarket.com',
+        key=os.getenv('PM_POLYMARKET_WALLET_PRIVATE_KEY'),
+        chain_id=137, signature_type=0,
+    )
+    clob.set_api_creds(creds)
+    return clob
+
+
+def load_state() -> dict:
+    if STATE_FILE.exists():
+        return json.loads(STATE_FILE.read_text())
+    return {
+        "bankroll": 0.0,
+        "trades": [],
+        "total_invested": 0.0,
+        "total_returned": 0.0,
+        "consecutive_losses": 0,
+        "daily_start_bankroll": 0.0,
+        "daily_start_date": "",
+    }
+
+
+def save_state(state: dict) -> None:
+    STATE_FILE.parent.mkdir(exist_ok=True)
+    STATE_FILE.write_text(json.dumps(state, indent=2))
+
+
+async def gate3_orderbook(client: httpx.AsyncClient, coin: str, direction: str) -> bool:
+    """Gate 3: Binance top-10 order book confirms continued pressure in direction.
+    UP move: bid volume > ask volume. DOWN move: ask volume > bid volume."""
+    symbol = COIN_TO_ASSET[coin] + "USDT"
+    try:
+        resp = await client.get(
+            f"https://api.binance.com/api/v3/depth?symbol={symbol}&limit=10",
+            timeout=3,
+        )
+        data = resp.json()
+        bid_vol = sum(float(qty) for _, qty in data.get("bids", []))
+        ask_vol = sum(float(qty) for _, qty in data.get("asks", []))
+        if direction == "up":
+            return bid_vol > ask_vol
+        else:
+            return ask_vol > bid_vol
+    except Exception as e:
+        logger.debug("orderbook_error", coin=coin, error=str(e))
+        return False  # fail safe: skip if can't check
+
+
+async def fetch_market_price(client: httpx.AsyncClient, coin: str, period_ts: int) -> dict | None:
+    """Fetch current market prices for a coin's period — called fresh at minute 12."""
+    slug = f"{coin}-updown-15m-{period_ts}"
+    try:
+        resp = await client.get(
+            f"https://gamma-api.polymarket.com/markets?slug={slug}",
+            timeout=8,
+        )
+        data = resp.json()
+        if not data:
+            return None
+        m = data[0]
+        tokens   = json.loads(m["clobTokenIds"])  if isinstance(m.get("clobTokenIds"), str) else m.get("clobTokenIds", [])
+        outcomes = json.loads(m["outcomes"])       if isinstance(m.get("outcomes"), str)      else m.get("outcomes", [])
+        prices   = json.loads(m["outcomePrices"])  if isinstance(m.get("outcomePrices"), str) else m.get("outcomePrices", [])
+        if len(tokens) < 2 or len(outcomes) < 2:
+            return None
+        up_idx   = next((i for i, o in enumerate(outcomes) if o.lower() == "up"),   0)
+        down_idx = next((i for i, o in enumerate(outcomes) if o.lower() == "down"), 1)
+        return {
+            "coin":          coin,
+            "condition_id":  m.get("conditionId", ""),
+            "up_token_id":   str(tokens[up_idx]),
+            "down_token_id": str(tokens[down_idx]),
+            "up_price":      float(prices[up_idx]),
+            "down_price":    float(prices[down_idx]),
+        }
+    except Exception as e:
+        logger.debug("fetch_market_price_error", coin=coin, error=str(e))
+        return None
+
+
+async def place_order(loop, clob: ClobClient, token_id: str,
+                      entry_price: float, tokens: float) -> str:
+    """Place a GTC buy order. Returns order_id or empty string on failure."""
+    try:
+        order_args = OrderArgs(
+            token_id=token_id,
+            price=round(entry_price, 4),
+            size=round(tokens, 2),
+            side=BUY,
+        )
+        signed = await loop.run_in_executor(None, clob.create_order, order_args)
+        result = await loop.run_in_executor(
+            None, functools.partial(clob.post_order, signed, OrderType.GTC))
+        return result.get("orderID", "")
+    except Exception as e:
+        logger.error("place_order_error", error=str(e)[:120])
+        return ""
+
+
+async def cancel_order(loop, clob: ClobClient, order_id: str) -> bool:
+    try:
+        await loop.run_in_executor(None, functools.partial(clob.cancel, order_id))
+        return True
+    except Exception as e:
+        logger.debug("cancel_error", order_id=order_id[:16], error=str(e))
+        return False
