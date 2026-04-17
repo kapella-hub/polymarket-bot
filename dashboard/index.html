@@ -15,6 +15,7 @@
     --blue: #60a5fa; --blue-dim: rgba(96,165,250,0.10);
     --amber: #fbbf24; --amber-dim: rgba(251,191,36,0.10);
     --purple: #a78bfa; --purple-dim: rgba(167,139,250,0.10);
+    --orange: #fb923c;
     --cyan: #22d3ee;
     --radius: 14px; --radius-sm: 8px;
   }
@@ -66,6 +67,7 @@
   .badge-red { background: var(--red-dim); color: var(--red); }
   .badge-blue { background: var(--blue-dim); color: var(--blue); }
   .badge-amber { background: var(--amber-dim); color: var(--amber); }
+  .badge-grey { background: rgba(120,120,120,0.15); color: #888; }
   .badge-purple { background: var(--purple-dim); color: var(--purple); }
   .pos-item { display: flex; justify-content: space-between; align-items: center; padding: 10px 14px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); margin-bottom: 6px; font-size: 0.85em; }
   .pos-left { flex: 1; min-width: 0; }
@@ -79,10 +81,21 @@
   .ai-card.critical { border-color: rgba(248,113,113,0.3); background: var(--red-dim); }
   .ai-summary { font-size: 0.82em; color: var(--text); line-height: 1.5; margin-top: 6px; }
   .ai-time { font-size: 0.7em; color: var(--text-dim); margin-top: 4px; }
+  .capital-row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-bottom: 20px; }
+  .cap-card { text-align: center; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 14px 8px; }
+  .cap-card.liquid { border-color: rgba(52,211,153,0.2); }
+  .cap-card.locked { border-color: rgba(251,191,36,0.2); }
+  .cap-card.btc    { border-color: rgba(251,146,60,0.2); }
+  .cap-num { font-size: 1.22em; font-weight: 800; color: var(--text-bright); }
+  .cap-num.green { color: var(--green); }
+  .cap-num.amber { color: var(--amber); }
+  .cap-num.orange { color: #fb923c; }
+  .cap-label { font-size: 0.65em; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-dim); margin-top: 3px; }
   .btc-price { font-size: 1.3em; font-weight: 700; color: #f7931a; text-align: center; margin: 10px 0; }
   .footer { padding: 14px 0 8px; font-size: 0.68em; color: var(--text-dim); text-align: center; }
   .empty { text-align: center; padding: 24px; color: var(--text-dim); font-size: 0.85em; }
-  @media (max-width: 640px) { body { padding: 14px; } .hero-value { font-size: 2em; } .grid-3 { grid-template-columns: 1fr 1fr; } }
+  .pos-profit { font-size: 0.75em; color: var(--text-dim); }
+  @media (max-width: 640px) { body { padding: 14px; } .hero-value { font-size: 2em; } .grid-3 { grid-template-columns: 1fr 1fr; } .capital-row { grid-template-columns: 1fr 1fr; } }
 </style>
 </head>
 <body>
@@ -98,7 +111,20 @@
 <script>
 const API = window.location.origin;
 let D = null;
-function usd(n) { return '$' + Number(n||0).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}); }
+
+function usd(n, dec) {
+  dec = dec === undefined ? 2 : dec;
+  return '$' + Number(n||0).toLocaleString('en-US',{minimumFractionDigits:dec,maximumFractionDigits:dec});
+}
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+function badge(label, cls) {
+  return el('span', 'badge ' + cls, label);
+}
 
 async function refresh() {
   try {
@@ -114,81 +140,254 @@ async function refresh() {
 
 function render() {
   if (!D) return;
-  const c = D.contrarian || {};
-  const pt = D.power_trader || {};
-  const ai = D.ai_monitor || {};
-  const positions = pt.positions || [];
-  const pnl = c.pnl || 0;
-  const btcStr = c.btc ? '$' + Number(c.btc).toLocaleString('en-US', {maximumFractionDigits:0}) : '--';
-  const trades = (c.wins||0) + (c.losses||0);
-  const pending = c.pending ? '<span class="badge badge-amber">SIGNAL PENDING</span>' : '<span class="badge badge-blue">WATCHING</span>';
-  const elapsed = parseInt(c.period_elapsed) || 0;
-  const pct = Math.min(100, (elapsed / 900) * 100);
-  const rem = Math.max(0, 900 - elapsed);
-  const remM = Math.floor(rem / 60);
-  const remS = rem % 60;
+  const sn  = D.sniper        || {};
+  const pt  = D.power_trader || {};
+  const walletUsdc = D.wallet_usdc || 0;
+  const positions  = pt.positions  || [];
 
-  let posHtml = '';
-  for (const p of positions) {
-    const profit = (p.tokens * 0.90) - p.size;
-    posHtml += '<div class="pos-item"><div class="pos-left"><div class="pos-name">' +
-      (p.question||'').substring(0,45) + '</div><div class="pos-detail">' +
-      p.side + ' @ $' + (p.price||0).toFixed(3) + ' | ' + (p.tokens||0).toFixed(0) +
-      ' tokens</div></div><div class="pos-right"><div class="pos-value pos">+$' +
-      profit.toFixed(2) + '</div><div class="pos-detail">if wins</div></div></div>';
+  const gtaPaid      = pt.total_invested || 0;
+  const gtaPotential = positions.reduce((s,p) => s + (p.tokens||0) * 0.90, 0);
+  const liquidTotal  = walletUsdc + (sn.bankroll||0);
+  const totalPort    = liquidTotal + gtaPaid;
+
+  const pnl     = sn.pnl || 0;
+  const elapsed = parseInt((sn.period_elapsed||'').replace('s','')) || 0;
+  const pct     = Math.min(100, (elapsed / 900) * 100);
+  const rem     = Math.max(0, 900 - elapsed);
+  const remM    = Math.floor(rem / 60);
+  const remS    = String(rem % 60).padStart(2,'0');
+  const btcStr  = sn.btc ? usd(sn.btc, 0) : '--';
+
+  const app = document.getElementById('app');
+  app.textContent = '';
+
+  // ── Hero ─────────────────────────────────────
+  const hero = el('div', 'hero');
+  hero.append(el('div', 'hero-label', 'Total Portfolio Value'));
+  hero.append(el('div', 'hero-value', usd(totalPort)));
+  const sub = el('div', 'hero-sub');
+  const s1 = el('span'); s1.textContent = usd(liquidTotal) + ' liquid';
+  const sep = el('span', 'text-dim', ' · ');
+  const s2 = el('span'); s2.textContent = usd(gtaPaid) + ' locked → ' + usd(gtaPotential) + ' potential';
+  sub.style.cssText = 'display:flex;justify-content:center;gap:6px;margin-top:8px;font-size:0.78em;color:var(--text-dim);flex-wrap:wrap';
+  sub.append(s1, sep, s2);
+  hero.append(sub);
+  app.append(hero);
+
+  // ── Capital row ───────────────────────────────
+  const capRow = el('div', 'capital-row');
+  function capCard(num, label, numCls, cardCls) {
+    const card = el('div', 'cap-card ' + cardCls);
+    card.append(el('div', 'cap-num ' + numCls, num));
+    card.append(el('div', 'cap-label', label));
+    return card;
   }
-  if (!positions.length) posHtml = '<div class="empty">No positions</div>';
+  capRow.append(
+    capCard(usd(walletUsdc),  'Wallet USDC',   'green',  'liquid'),
+    capCard(usd(gtaPaid),     'Locked in Markets', 'amber',  'locked'),
+    capCard(btcStr,           'BTC Price',     'orange', 'btc')
+  );
+  app.append(capRow);
 
-  let tradeHtml = '';
-  for (const t of (c.recent_trades||[]).slice(-5)) {
-    if (t.side && (t.entry || t.pnl)) {
-      const st = t.status === 'won' ? 'badge-green' : t.status === 'lost' ? 'badge-red' : 'badge-blue';
-      const label = t.status || 'placed';
-      tradeHtml += '<div class="pos-item"><div class="pos-left"><div class="pos-name">' +
-        (t.side||'') + (t.entry ? ' @ ' + t.entry : '') + '</div><div class="pos-detail">' +
-        (t.trigger || ('P&L: ' + (t.pnl||''))) + '</div></div><div class="pos-right">' +
-        '<span class="badge ' + st + '">' + label + '</span></div></div>';
+  // ── Momentum Sniper ───────────────────────────
+  const snSection = el('div', 'section');
+  snSection.append(el('div', 'section-title', 'Momentum Sniper — 6 Coins'));
+  const snCard = el('div', 'card');
+
+  function kvRow(label, valueNode) {
+    const row = el('div', 'kv');
+    row.append(el('span', 'kv-label', label));
+    if (typeof valueNode === 'string') {
+      row.append(el('span', 'kv-val', valueNode));
+    } else {
+      const v = el('span', 'kv-val'); v.append(valueNode); row.append(v);
+    }
+    return row;
+  }
+
+  const circuitStr = sn.circuit || 'ok';
+  let snStatusBadge;
+  if (circuitStr.startsWith('PAUSED')) {
+    snStatusBadge = badge(circuitStr, 'badge-red');
+  } else if (elapsed <= 90) {
+    snStatusBadge = badge('Snipe Window (' + elapsed + 's)', 'badge-amber');
+  } else {
+    snStatusBadge = badge('Waiting for next period', 'badge-blue');
+  }
+  snCard.append(kvRow('Strategy', 'Buy momentum within first 90s · entry $0.52 · 6 coins'));
+  snCard.append(kvRow('Status', snStatusBadge));
+
+  const pnlSpan = el('span', pnl >= 0 ? 'pos' : 'neg', (pnl>=0?'+':'') + usd(pnl));
+  const bkRow = el('span'); bkRow.textContent = usd(sn.bankroll) + '  ·  ' + (sn.wins||0) + 'W / ' + (sn.losses||0) + 'L  ·  P&L ';
+  bkRow.append(pnlSpan);
+  snCard.append(kvRow('Bankroll', bkRow));
+
+  const periodRow = el('span');
+  periodRow.textContent = elapsed <= 90
+    ? ('⚡ SNIPE WINDOW — ' + elapsed + 's elapsed')
+    : (remM + 'm ' + remS + 's until next window');
+  snCard.append(kvRow('Period', periodRow));
+
+  // Progress bar — highlights snipe window in green, rest in grey
+  const progWrap = el('div'); progWrap.style.cssText = 'margin-top:10px;height:5px;border-radius:3px;background:var(--surface-2);overflow:hidden';
+  const progFill = el('div');
+  const barColor = elapsed <= 90 ? 'linear-gradient(90deg,var(--green),var(--cyan))' : 'linear-gradient(90deg,var(--blue),var(--cyan))';
+  progFill.style.cssText = 'height:100%;width:' + pct + '%;background:' + barColor + ';border-radius:3px;transition:width 1s linear';
+  progWrap.append(progFill);
+  snCard.append(progWrap);
+  snSection.append(snCard);
+  app.append(snSection);
+
+  // ── Recent sniper fires ───────────────────────
+  const recentFires = (sn.recent_trades||[]).slice(-5);
+  if (recentFires.length) {
+    const fireSection = el('div', 'section');
+    fireSection.append(el('div', 'section-title', 'Recent Snipe Orders'));
+    for (const t of recentFires.slice().reverse()) {
+      const item = el('div', 'pos-item');
+      const left = el('div', 'pos-left');
+      const coinLabel = (t.coin||'?').toUpperCase() + ' ' + (t.side||'');
+      left.append(el('div', 'pos-name', coinLabel));
+      left.append(el('div', 'pos-detail', 'move ' + (t.move||'?') + ' · size ' + usd(t.size||0) + (t.boost && t.boost!=='1x' ? ' (' + t.boost + ' cross-confirm)' : '')));
+      item.append(left);
+      item.append(t.status === 'cancelled' ? badge('Cancelled', 'badge-grey') : badge('Placed', 'badge-amber'));
+      fireSection.append(item);
+    }
+    app.append(fireSection);
+  }
+
+  // ── Sniper resolved trades ────────────────────
+  const resolved = (sn.recent_resolved||[]).slice(-8);
+  if (resolved.length) {
+    const tSection = el('div', 'section');
+    tSection.append(el('div', 'section-title', 'Trade History'));
+    for (const t of resolved.slice().reverse()) {
+      const item = el('div', 'pos-item');
+      const left = el('div', 'pos-left');
+      const coinLabel = (t.coin||'?').toUpperCase() + ' ' + (t.side||'');
+      left.append(el('div', 'pos-name', coinLabel));
+      left.append(el('div', 'pos-detail', 'move ' + (t.move_pct||'?') + '%'));
+      item.append(left);
+      const right = el('div'); right.style.display = 'flex'; right.style.gap = '8px'; right.style.alignItems = 'center';
+      const pnlEl = el('span', parseFloat(t.pnl||0)>=0?'pos':'neg', (parseFloat(t.pnl||0)>=0?'+':'') + usd(t.pnl));
+      right.append(pnlEl, badge(t.status, t.status==='won'?'badge-green':'badge-red'));
+      item.append(right);
+      tSection.append(item);
+    }
+    app.append(tSection);
+  }
+
+  // ── Certainty Sniper ──────────────────────────
+  const cs = data.certainty_sniper || {};
+  if (cs.bankroll > 0 || (cs.recent_trades||[]).length) {
+    const csSection = el('div', 'section');
+    csSection.append(el('div', 'section-title', 'Certainty Sniper — Late-Period'));
+    const csCard = el('div', 'card');
+
+    let csStatusBadge;
+    const csElapsed = parseInt(cs.period_elapsed||'0');
+    if (csElapsed >= 720 && csElapsed <= 840)
+      csStatusBadge = badge('Certainty Window (' + csElapsed + 's)', 'badge-amber');
+    else if ((cs.circuit||'ok') !== 'ok')
+      csStatusBadge = badge('Circuit Open — ' + cs.circuit, 'badge-red');
+    else
+      csStatusBadge = badge('Watching · next window at 12min', 'badge-blue');
+
+    const csBkEl = el('span');
+    const csTrades = (cs.wins||0) + (cs.losses||0);
+    csBkEl.textContent = usd(cs.bankroll) + '  ·  ' + cs.wins + 'W/' + (cs.losses||0) + 'L  ·  P&L ' + (cs.pnl >= 0 ? '+' : '') + usd(cs.pnl||0) + '  ·  win ' + (cs.win_rate||'--');
+    csCard.append(kvRow('Status', csStatusBadge));
+    csCard.append(kvRow('Bankroll', csBkEl));
+    csSection.append(csCard);
+    app.append(csSection);
+
+    const csRecentFires = (cs.recent_trades||[]).slice(-5);
+    if (csRecentFires.length) {
+      const csFireSection = el('div', 'section');
+      csFireSection.append(el('div', 'section-title', 'Recent Certainty Orders'));
+      for (const t of csRecentFires.slice().reverse()) {
+        const item = el('div', 'pos-item');
+        const left = el('div', 'pos-left');
+        left.append(el('div', 'pos-name', (t.coin||'?').toUpperCase() + ' ' + (t.side||'')));
+        left.append(el('div', 'pos-detail',
+          'move ' + (t.move||'?') + ' · entry ' + usd(parseFloat(t.entry_price||0)) + ' · size ' + usd(parseFloat(t.size_usd||0))));
+        item.append(left);
+        item.append(t.status === 'cancelled' ? badge('Cancelled', 'badge-grey') : badge('Placed', 'badge-amber'));
+        csFireSection.append(item);
+      }
+      app.append(csFireSection);
+    }
+
+    const csResolved = (cs.recent_resolved||[]).slice(-8);
+    if (csResolved.length) {
+      const csHistSection = el('div', 'section');
+      csHistSection.append(el('div', 'section-title', 'Certainty Trade History'));
+      for (const t of csResolved.slice().reverse()) {
+        const won = t.won === 'True' || t.won === true;
+        const item = el('div', 'pos-item');
+        const left = el('div', 'pos-left');
+        left.append(el('div', 'pos-name', (t.coin||'?').toUpperCase() + ' ' + (t.side||'')));
+        left.append(el('div', 'pos-detail', 'pnl ' + (won ? '+' : '') + usd(parseFloat(t.pnl||0))));
+        item.append(left);
+        item.append(badge(won ? 'Won' : 'Lost', won ? 'badge-green' : 'badge-red'));
+        csHistSection.append(item);
+      }
+      app.append(csHistSection);
     }
   }
 
-  let signalHtml = '';
-  for (const s of (c.recent_signals||[]).slice(-3)) {
-    signalHtml += '<div class="pos-item"><div class="pos-left"><div class="pos-name">BTC moved ' +
-      (s.move||'?') + '</div><div class="pos-detail">Fade: ' + (s.fade||'?') +
-      '</div></div><div class="pos-right"><span class="badge badge-amber">SIGNAL</span></div></div>';
+  // ── Power Trader live status ──────────────────
+  const ptLiveSection = el('div', 'section');
+  ptLiveSection.append(el('div', 'section-title', 'Power Trader — Claude AI'));
+  const ptCard = el('div', 'card');
+  const ptStatus = pt.sleeping_until ? badge('Sleeping · next ' + pt.sleeping_until, 'badge-blue')
+                 : pt.cycle > 0      ? badge('Cycle ' + pt.cycle + ' running', 'badge-amber')
+                 :                     badge('Starting', 'badge-blue');
+  const ptBkRow = el('span'); ptBkRow.textContent = usd(pt.bankroll) + '  ·  ' + (pt.total_trades||0) + ' trades placed  ·  ' + (pt.open_trades||0) + ' open';
+  ptCard.append(kvRow('Status', ptStatus));
+  ptCard.append(kvRow('Bankroll', ptBkRow));
+  if ((pt.recent_executions||[]).length) {
+    const lastEx = pt.recent_executions[pt.recent_executions.length - 1];
+    const exEl = el('span'); exEl.textContent = (lastEx.q||lastEx.edge||'recent trade') + '  ' + (lastEx.side||'') + '  ' + usd(lastEx.size||0);
+    ptCard.append(kvRow('Last Trade', exEl));
   }
+  ptLiveSection.append(ptCard);
+  app.append(ptLiveSection);
 
-  const aiSt = (ai.status||'none').toLowerCase();
-  const aiCls = aiSt === 'ok' ? 'ok' : aiSt === 'warning' ? 'warning' : aiSt === 'critical' ? 'critical' : '';
-  const aiBadge = aiSt === 'ok' ? 'badge-green' : aiSt === 'warning' ? 'badge-amber' : 'badge-red';
+  // ── Open Long-term Positions ──────────────────
+  const ptSection = el('div', 'section');
+  const ptTitle = el('div', 'section-title');
+  ptTitle.append(document.createTextNode('Long-term Positions (' + positions.length + ')'));
+  const resolveNote = el('span'); resolveNote.style.cssText = 'margin-left:auto;font-weight:400;color:var(--amber)';
+  resolveNote.textContent = 'Resolves Jul 31 2026';
+  ptTitle.append(resolveNote);
+  ptSection.append(ptTitle);
 
-  document.getElementById('app').innerHTML =
-    '<div class="hero"><div class="hero-label">CONTRARIAN BOT BANKROLL</div>' +
-    '<div class="hero-value">' + usd(c.bankroll) + '</div>' +
-    '<div class="hero-sub"><span>P&L <strong class="' + (pnl>=0?'pos':'neg') + '">' + (pnl>=0?'+':'') + usd(pnl) + '</strong></span>' +
-    '<span>Win Rate <strong>' + (c.win_rate||'--') + '</strong></span>' +
-    '<span>Trades <strong>' + trades + '</strong></span></div></div>' +
-    '<div class="btc-price">BTC ' + btcStr + '</div>' +
-    '<div class="grid-3"><div class="stat-card"><div class="stat-num">' + (c.wins||0) + '</div><div class="stat-label">Wins</div></div>' +
-    '<div class="stat-card"><div class="stat-num">' + (c.losses||0) + '</div><div class="stat-label">Losses</div></div>' +
-    '<div class="stat-card"><div class="stat-num">' + (c.open||0) + '</div><div class="stat-label">Open</div></div></div>' +
-    '<div class="section"><div class="section-title">Contrarian Engine</div><div class="card">' +
-    '<div class="kv"><span class="kv-label">Strategy</span><span class="kv-val">Fade BTC moves &gt; 0.5%</span></div>' +
-    '<div class="kv"><span class="kv-label">Status</span><span class="kv-val">' + pending + '</span></div>' +
-    '<div class="kv"><span class="kv-label">Period</span><span class="kv-val">' + remM + 'm ' + remS + 's left</span></div>' +
-    '<div style="margin-top:8px;height:6px;border-radius:3px;background:var(--surface-2);overflow:hidden">' +
-    '<div style="height:100%;width:' + pct + '%;background:linear-gradient(90deg,var(--blue),var(--cyan));border-radius:3px;transition:width 1s"></div></div></div></div>' +
-    (signalHtml ? '<div class="section"><div class="section-title">Recent Signals</div>' + signalHtml + '</div>' : '') +
-    (tradeHtml ? '<div class="section"><div class="section-title">Recent Trades</div>' + tradeHtml + '</div>' : '') +
-    '<div class="section"><div class="section-title">Power Trader Positions (' + positions.length + ')</div>' + posHtml +
-    (positions.length ? '<div style="text-align:right;font-size:0.75em;color:var(--text-dim);padding:4px">Invested: ' + usd(pt.total_invested) + ' | Resolves: July 31</div>' : '') + '</div>' +
-    (ai.status && ai.status !== 'none' ? '<div class="section"><div class="section-title">Claude Analysis</div>' +
-    '<div class="card ai-card ' + aiCls + '"><div style="display:flex;justify-content:space-between;align-items:center">' +
-    '<span style="font-weight:700;font-size:0.85em;color:var(--text-bright)">Health Check</span>' +
-    '<span class="badge ' + aiBadge + '">' + (ai.status||'') + '</span></div>' +
-    '<div class="ai-summary">' + (ai.summary||'') + '</div>' +
-    (ai.issues && ai.issues !== 'NONE' ? '<div style="font-size:0.75em;color:var(--amber);margin-top:4px">' + ai.issues + '</div>' : '') +
-    '<div class="ai-time">' + (ai.timestamp||'') + '</div></div></div>' : '');
+  if (!positions.length) {
+    ptSection.append(el('div', 'empty', 'No positions'));
+  } else {
+    for (const p of positions) {
+      const payout = (p.tokens||0) * 0.90;
+      const profit = payout - (p.size||0);
+      const item = el('div', 'pos-item');
+      const left = el('div', 'pos-left');
+      left.append(el('div', 'pos-name', (p.question||'').substring(0,52)));
+      left.append(el('div', 'pos-detail', 'NO @ ' + usd(p.price) + '  ·  paid ' + usd(p.size)));
+      item.append(left);
+      const right = el('div', 'pos-right');
+      right.append(el('div', 'pos-value pos', usd(payout)));
+      right.append(el('div', 'pos-profit', '+' + usd(profit) + ' profit'));
+      item.append(right);
+      ptSection.append(item);
+    }
+    const footer = el('div'); footer.style.cssText = 'display:flex;justify-content:space-between;padding:8px 14px 2px;font-size:0.75em;color:var(--text-dim)';
+    const finvest = el('span'); finvest.textContent = 'Invested: '; const finvestV = el('strong'); finvestV.textContent = usd(gtaPaid); finvest.append(finvestV);
+    const fpot    = el('span'); fpot.textContent = 'If all win: ';   const fpotV = el('strong', 'pos'); fpotV.textContent = usd(gtaPotential); fpot.append(fpotV);
+    const fprofit = el('span'); fprofit.textContent = 'Profit: ';    const fprofitV = el('strong', 'pos'); fprofitV.textContent = '+' + usd(gtaPotential - gtaPaid); fprofit.append(fprofitV);
+    footer.append(finvest, fpot, fprofit);
+    ptSection.append(footer);
+  }
+  app.append(ptSection);
 }
 
 setInterval(refresh, 5000);
