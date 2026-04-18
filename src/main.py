@@ -1,9 +1,13 @@
 """FastAPI application with lifespan-managed background services."""
 
 import asyncio
+import csv
+import io
+import json
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 
 import structlog
 from fastapi import FastAPI
@@ -40,6 +44,118 @@ _ensemble: EnsembleEngine | None = None
 _executor: ExecutionEngine | None = None
 _nexus: NexusClient | None = None
 _shutdown_event = asyncio.Event()
+
+
+def _to_float(value) -> float:
+    try:
+        if value is None or value == "":
+            return 0.0
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _load_certainty_analytics(base: Path) -> dict:
+    fill_path = base / "data" / "certainty_fill_journal.jsonl"
+    state_path = base / "data" / "certainty_sniper_state.json"
+
+    fills = []
+    if fill_path.exists():
+        for line in fill_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                fills.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+    trades = []
+    if state_path.exists():
+        try:
+            trades = json.loads(state_path.read_text(encoding="utf-8")).get("trades", [])
+        except json.JSONDecodeError:
+            trades = []
+
+    trades_by_order = {
+        t.get("order_id"): t
+        for t in trades
+        if t.get("order_id")
+    }
+
+    rows = []
+    for fill in fills:
+        raw = fill.get("raw", {}) if isinstance(fill.get("raw"), dict) else {}
+        order_id = fill.get("order_id") or raw.get("orderID") or raw.get("id")
+        trade = trades_by_order.get(order_id, {})
+        rows.append({
+            "coin": fill.get("coin", ""),
+            "order_id": order_id or "",
+            "requested_price": _to_float(fill.get("requested_price")),
+            "fill_price": _to_float(fill.get("fill_price")),
+            "requested_notional": _to_float(fill.get("requested_notional")),
+            "filled_notional": _to_float(fill.get("filled_notional")),
+            "requested_tokens": _to_float(fill.get("requested_tokens")),
+            "filled_tokens": _to_float(fill.get("filled_tokens")),
+            "ask_usd_vol": _to_float(fill.get("ask_usd_vol")),
+            "status": trade.get("status", ""),
+            "pnl": _to_float(trade.get("pnl")),
+        })
+
+    attempts = len(rows)
+    any_fill = sum(1 for row in rows if row["filled_notional"] > 0)
+    full_fill = sum(
+        1
+        for row in rows
+        if row["requested_tokens"] > 0
+        and row["filled_tokens"] >= row["requested_tokens"] * 0.999
+    )
+    slippages = [
+        row["fill_price"] - row["requested_price"]
+        for row in rows
+        if row["filled_notional"] > 0 and row["requested_price"] > 0 and row["fill_price"] > 0
+    ]
+    settled = [row for row in rows if row["status"] in ("won", "lost")]
+    wins = sum(1 for row in settled if row["status"] == "won")
+
+    by_coin: dict[str, dict] = {}
+    for row in rows:
+        coin = row["coin"] or "unknown"
+        stats = by_coin.setdefault(
+            coin,
+            {"attempts": 0, "any_fill": 0, "full_fill": 0, "settled": 0, "wins": 0, "pnl": 0.0}
+        )
+        stats["attempts"] += 1
+        if row["filled_notional"] > 0:
+            stats["any_fill"] += 1
+        if row["requested_tokens"] > 0 and row["filled_tokens"] >= row["requested_tokens"] * 0.999:
+            stats["full_fill"] += 1
+        if row["status"] in ("won", "lost"):
+            stats["settled"] += 1
+            stats["wins"] += int(row["status"] == "won")
+            stats["pnl"] += row["pnl"]
+
+    worst_coin = None
+    if by_coin:
+        worst_coin = min(
+            by_coin.items(),
+            key=lambda kv: (
+                (kv[1]["any_fill"] / kv[1]["attempts"]) if kv[1]["attempts"] else 1.0,
+                kv[1]["pnl"],
+            ),
+        )[0]
+
+    return {
+        "attempts": attempts,
+        "any_fill_rate": (any_fill / attempts) if attempts else 0.0,
+        "full_fill_rate": (full_fill / attempts) if attempts else 0.0,
+        "avg_slippage": (sum(slippages) / len(slippages)) if slippages else 0.0,
+        "settled_win_rate": (wins / len(settled)) if settled else 0.0,
+        "settled_count": len(settled),
+        "worst_coin": worst_coin or "",
+        "by_coin": by_coin,
+        "rows": rows,
+    }
 
 
 async def _discovery_loop() -> None:
@@ -557,7 +673,10 @@ async def all_status():
                    "circuit": "ok", "recent_trades": [], "recent_resolved": []},
         "certainty_sniper": {"bankroll": 0, "pnl": 0, "wins": 0, "losses": 0,
                              "win_rate": "--", "open": 0, "btc": 0, "period_elapsed": "",
-                             "circuit": "ok", "recent_trades": [], "recent_resolved": []},
+                             "circuit": "ok", "recent_trades": [], "recent_resolved": [],
+                             "analytics": {"attempts": 0, "any_fill_rate": 0, "full_fill_rate": 0,
+                                           "avg_slippage": 0, "settled_win_rate": 0,
+                                           "settled_count": 0, "worst_coin": "", "by_coin": {}}},
         "open_positions": [],
         "wallet_usdc": 0,
         "ai_monitor": {"status": "none", "summary": "", "issues": "", "timestamp": ""},
@@ -665,9 +784,17 @@ async def all_status():
                 "circuit": cs_latest.get("circuit", "ok"),
                 "recent_trades": cs_trades[-10:],
                 "recent_resolved": cs_resolved[-10:],
+                "analytics": result["certainty_sniper"]["analytics"],
             }
         except Exception:
             pass
+
+    try:
+        result["certainty_sniper"]["analytics"] = {
+            k: v for k, v in _load_certainty_analytics(base).items() if k != "rows"
+        }
+    except Exception:
+        pass
 
     # --- Open long-term positions (from legacy power_trade_state.json) ---
     pt_state = base / "data" / "power_trade_state.json"
@@ -718,6 +845,38 @@ async def all_status():
             pass
 
     return result
+
+
+@app.get("/api/certainty-report.csv")
+async def certainty_report_csv():
+    base = Path(__file__).parent.parent
+    analytics = _load_certainty_analytics(base)
+    output = io.StringIO()
+    writer = csv.DictWriter(
+        output,
+        fieldnames=[
+            "coin",
+            "order_id",
+            "requested_price",
+            "fill_price",
+            "requested_notional",
+            "filled_notional",
+            "requested_tokens",
+            "filled_tokens",
+            "ask_usd_vol",
+            "status",
+            "pnl",
+        ],
+    )
+    writer.writeheader()
+    for row in analytics["rows"]:
+        writer.writerow(row)
+
+    return Response(
+        content=output.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=certainty-report.csv"},
+    )
 
 
 @app.get("/api/ai-monitor")

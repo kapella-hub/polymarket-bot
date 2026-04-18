@@ -48,19 +48,25 @@ logger = structlog.get_logger()
 
 LOG_FILE   = Path(__file__).parent / "certainty_sniper_output.log"
 STATE_FILE = Path(__file__).parent / "data" / "certainty_sniper_state.json"
+FILL_LOG_FILE = Path(__file__).parent / "data" / "certainty_fill_journal.jsonl"
 
 COINS         = ["btc", "eth", "sol", "xrp", "doge", "bnb"]
 COIN_TO_ASSET = {"btc": "BTC", "eth": "ETH", "sol": "SOL",
                  "xrp": "XRP", "doge": "DOGE", "bnb": "BNB"}
-# Only trade coins with enough CLOB liquidity to support late-period entries
-LIQUID_COINS  = frozenset(["btc"])
+BOOK_MIN_BY_COIN = {
+    "btc": 20.0,
+    "eth": 16.0,
+    "sol": 14.0,
+    "xrp": 10.0,
+    "doge": 10.0,
+    "bnb": 10.0,
+}
 
 # Timing
 CERTAINTY_START  = 720   # 12 min into period — start checking
 CERTAINTY_END    = 780   # 13 min into period — stop (2 min remaining, avoid liquidity desert)
 CHECK_INTERVAL   = 30    # Check every 30s in window
-CANCEL_AFTER     = 5     # Cancel unfilled order quickly — need fill before period ends
-MIN_BOOK_VOLUME  = 20.0  # Min USD resting at best ask on CLOB before placing
+MAX_OPEN_TRADES  = 2     # Avoid over-concentrating when multiple coins fire together
 
 # Signal thresholds
 MIN_MOVE_PCT       = 0.007  # Gate 1: target coin moved >=0.7%
@@ -72,6 +78,8 @@ MAX_ENTRY_PRICE    = 0.92   # Skip if market already priced certainty in
 BET_MIN              = 8.0
 BET_MAX              = 40.0
 MAX_BET_PCT_BANKROLL = 0.15   # Hard ceiling — guards against over-optimistic win_rate
+BOOK_TAKE_PCT        = 0.35   # Only lean on a fraction of visible asks to reduce FAK misses
+MAX_TRADES_PER_COIN_PER_DAY = 8
 
 # Risk controls
 CIRCUIT_LOSSES    = 2     # Consecutive losses before pause
@@ -172,6 +180,100 @@ def save_state(state: dict) -> None:
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
+def append_fill_journal(entry: dict) -> None:
+    FILL_LOG_FILE.parent.mkdir(exist_ok=True)
+    with FILL_LOG_FILE.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, sort_keys=True) + "\n")
+
+
+def coin_book_min_usd(coin: str) -> float:
+    return BOOK_MIN_BY_COIN.get(coin, min(BOOK_MIN_BY_COIN.values()))
+
+
+def count_coin_trades_today(trades: list[dict], coin: str, today: str) -> int:
+    count = 0
+    for trade in trades:
+        if trade.get("coin") != coin:
+            continue
+        placed_at = trade.get("placed_at")
+        if not placed_at:
+            continue
+        try:
+            trade_day = datetime.fromtimestamp(float(placed_at), tz=timezone.utc).date().isoformat()
+        except (TypeError, ValueError, OSError):
+            continue
+        if trade_day == today:
+            count += 1
+    return count
+
+
+def target_size_usd(bankroll: float, ask_usd_vol: float, coin: str) -> float:
+    """Size by bankroll, then clip to a fraction of visible ask liquidity."""
+    base_size = min(kelly_size(bankroll), bankroll - 5)
+    book_limited = ask_usd_vol * BOOK_TAKE_PCT
+    coin_min = coin_book_min_usd(coin)
+    if ask_usd_vol < coin_min:
+        return 0.0
+    if book_limited < BET_MIN:
+        return 0.0
+    return min(base_size, BET_MAX, round(book_limited, 2))
+
+
+def _coerce_float(value: Any) -> float | None:
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def extract_fill_metrics(result: dict, requested_tokens: float, limit_price: float) -> tuple[float, float]:
+    """Best-effort parse of filled tokens / average price from exchange response."""
+    token_candidates = (
+        result.get("filledSize"),
+        result.get("filled_size"),
+        result.get("sizeMatched"),
+        result.get("size_matched"),
+        result.get("matchedSize"),
+        result.get("matched_size"),
+        result.get("takerFillSize"),
+        result.get("makerFillSize"),
+    )
+    filled_tokens = next((v for v in (_coerce_float(x) for x in token_candidates) if v and v > 0), None)
+    if filled_tokens is None:
+        status = str(result.get("status", "")).lower()
+        if status in {"filled", "matched"}:
+            filled_tokens = requested_tokens
+        else:
+            filled_tokens = 0.0
+
+    price_candidates = (
+        result.get("avgPrice"),
+        result.get("avg_price"),
+        result.get("price"),
+        result.get("matchedPrice"),
+        result.get("matched_price"),
+    )
+    avg_price = next((v for v in (_coerce_float(x) for x in price_candidates) if v and v > 0), None)
+    if avg_price is None:
+        spent_candidates = (
+            result.get("filledValue"),
+            result.get("filled_value"),
+            result.get("takingAmount"),
+            result.get("taking_amount"),
+            result.get("matchedAmount"),
+            result.get("matched_amount"),
+        )
+        spent = next((v for v in (_coerce_float(x) for x in spent_candidates) if v and v > 0), None)
+        if spent is not None and filled_tokens > 0:
+            avg_price = spent / filled_tokens
+
+    if avg_price is None or avg_price <= 0:
+        avg_price = limit_price
+    return round(filled_tokens, 4), round(avg_price, 4)
+
+
 async def gate3_orderbook(client: httpx.AsyncClient, coin: str, direction: str) -> bool:
     """Gate 3: Binance top-10 order book confirms continued pressure in direction.
     UP move: bid volume > ask volume. DOWN move: ask volume > bid volume."""
@@ -247,8 +349,8 @@ async def fetch_market_price(client: httpx.AsyncClient, coin: str, period_ts: in
 
 
 async def place_order(loop, clob: ClobClient, token_id: str,
-                      entry_price: float, tokens: float) -> str:
-    """Place a FAK buy order. Fills immediately or auto-cancels. Returns order_id or ''."""
+                      entry_price: float, tokens: float) -> dict:
+    """Place a FAK buy order and return the raw exchange response plus parsed fill metrics."""
     if OrderArgs is None or OrderType is None or BUY is None:
         raise RuntimeError("py_clob_client is not installed")
     try:
@@ -261,19 +363,22 @@ async def place_order(loop, clob: ClobClient, token_id: str,
         signed = await loop.run_in_executor(None, clob.create_order, order_args)
         result = await loop.run_in_executor(
             None, functools.partial(clob.post_order, signed, OrderType.FAK))
-        return result.get("orderID", "")
+        order_id = result.get("orderID", result.get("id", ""))
+        filled_tokens, avg_price = extract_fill_metrics(result, tokens, entry_price)
+        return {
+            "order_id": order_id,
+            "filled_tokens": filled_tokens,
+            "avg_price": avg_price,
+            "raw": result,
+        }
     except Exception as e:
         logger.error("place_order_error", error=str(e)[:120])
-        return ""
-
-
-async def cancel_order(loop, clob: ClobClient, order_id: str) -> bool:
-    try:
-        await loop.run_in_executor(None, functools.partial(clob.cancel, order_id))
-        return True
-    except Exception as e:
-        logger.debug("cancel_error", order_id=order_id[:16], error=str(e))
-        return False
+        return {
+            "order_id": "",
+            "filled_tokens": 0.0,
+            "avg_price": entry_price,
+            "raw": {"error": str(e)[:240]},
+        }
 
 
 async def main():
@@ -389,25 +494,6 @@ async def main():
                             circuit="skip%d" % skip_signals if skip_signals else "ok")
                 last_status = now_ts
 
-            # ── CANCEL UNFILLED ORDERS ────────────────────────
-            for trade in list(open_trades):
-                if trade["status"] != "placed":
-                    continue
-                if now_f < trade.get("cancel_at", float("inf")):
-                    continue
-                cancelled = await cancel_order(loop, clob, trade["order_id"])
-                if cancelled:
-                    bankroll += trade["size_usd"]
-                    state["bankroll"] = bankroll
-                    trade["status"] = "cancelled"
-                    trade["pnl"]    = 0
-                    save_state(state)
-                    logger.info("CERTAINTY_CANCELLED",
-                                coin=trade["coin"].upper(),
-                                order_id=trade["order_id"][:16])
-                else:
-                    trade["cancel_at"] = now_f + 15
-
             # ── RESOLVE TRADES (period_end + 120s grace) ──────
             for trade in list(open_trades):
                 if trade["status"] != "placed":
@@ -509,11 +595,17 @@ async def main():
                 last_check_ts = now_ts
                 period_prices = hist_start.get(current_period, {})
                 all_moves     = compute_all_moves(ws_feed, period_prices)
+                active_positions = sum(1 for t in open_trades if t["status"] == "placed")
+                today = datetime.now(timezone.utc).date().isoformat()
 
                 for coin in COINS:
-                    if coin not in LIQUID_COINS:
-                        continue
                     if coin in fired_this_period:
+                        continue
+                    if active_positions >= MAX_OPEN_TRADES:
+                        break
+                    if count_coin_trades_today(state["trades"], coin, today) >= MAX_TRADES_PER_COIN_PER_DAY:
+                        logger.info("certainty_skip_daily_coin_cap", coin=coin, cap=MAX_TRADES_PER_COIN_PER_DAY)
+                        fired_this_period.add(coin)
                         continue
 
                     move = all_moves.get(coin, 0.0)
@@ -548,9 +640,11 @@ async def main():
                     token_id  = market["up_token_id"] if direction == "up" else market["down_token_id"]
                     # Gate 4: CLOB book must have enough liquidity to fill
                     clob_ask, ask_usd_vol = await get_clob_ask(http, token_id)
-                    if clob_ask <= 0 or ask_usd_vol < MIN_BOOK_VOLUME:
+                    min_book_usd = coin_book_min_usd(coin)
+                    if clob_ask <= 0 or ask_usd_vol < min_book_usd:
                         logger.info("certainty_skip_thin_book",
-                                    coin=coin, ask_vol_usd=round(ask_usd_vol, 1))
+                                    coin=coin, ask_vol_usd=round(ask_usd_vol, 1),
+                                    min_book_usd=min_book_usd)
                         fired_this_period.add(coin)
                         continue
 
@@ -563,14 +657,25 @@ async def main():
                         fired_this_period.add(coin)
                         continue
 
-                    size_usd = min(kelly_size(bankroll), bankroll - 5)
+                    size_usd = target_size_usd(bankroll, ask_usd_vol, coin)
                     if size_usd < BET_MIN:
+                        logger.info("certainty_skip_small_size",
+                                    coin=coin,
+                                    ask_vol_usd=round(ask_usd_vol, 1),
+                                    target_size=round(size_usd, 2))
                         continue
 
-                    # Cap tokens to available CLOB volume so FAK fills fully
-                    available_tokens = ask_usd_vol / entry_price
+                    # Cap to a fraction of visible depth; FAK should not assume we own the whole level.
+                    available_tokens = (ask_usd_vol * BOOK_TAKE_PCT) / entry_price
                     tokens = min(size_usd / entry_price, available_tokens)
                     actual_size = round(tokens * entry_price, 2)
+                    if actual_size < BET_MIN:
+                        logger.info("certainty_skip_fractional_depth",
+                                    coin=coin,
+                                    ask_vol_usd=round(ask_usd_vol, 1),
+                                    take_pct=BOOK_TAKE_PCT)
+                        fired_this_period.add(coin)
+                        continue
 
                     logger.info("certainty_signal",
                                 coin=coin, direction=direction,
@@ -580,8 +685,35 @@ async def main():
                                 ask_vol=round(ask_usd_vol, 1),
                                 elapsed=elapsed)
 
-                    order_id = await place_order(loop, clob, token_id, entry_price, tokens)
-                    if not order_id:
+                    order = await place_order(loop, clob, token_id, entry_price, tokens)
+                    filled_tokens = order["filled_tokens"]
+                    fill_price = order["avg_price"]
+                    actual_size = round(filled_tokens * fill_price, 2)
+                    order_id = order["order_id"]
+
+                    append_fill_journal({
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "coin": coin,
+                        "side": side,
+                        "period": current_period,
+                        "token_id": token_id,
+                        "requested_tokens": round(tokens, 4),
+                        "requested_price": entry_price,
+                        "requested_notional": round(tokens * entry_price, 2),
+                        "filled_tokens": filled_tokens,
+                        "fill_price": fill_price,
+                        "filled_notional": actual_size,
+                        "ask_usd_vol": round(ask_usd_vol, 2),
+                        "raw": order["raw"],
+                    })
+
+                    if not order_id or filled_tokens <= 0 or actual_size < 1.0:
+                        logger.info("certainty_unfilled",
+                                    coin=coin,
+                                    requested_tokens=round(tokens, 2),
+                                    order_id=(order_id[:16] if order_id else ""),
+                                    filled_tokens=filled_tokens)
+                        fired_this_period.add(coin)
                         continue
 
                     bankroll -= actual_size
@@ -594,12 +726,13 @@ async def main():
                         "side":         side,
                         "token_id":     token_id,
                         "condition_id": market["condition_id"],
-                        "entry_price":  entry_price,
+                        "entry_price":  fill_price,
                         "size_usd":     actual_size,
-                        "tokens":       round(tokens, 4),
+                        "requested_entry_price": entry_price,
+                        "requested_tokens": round(tokens, 4),
+                        "tokens":       filled_tokens,
                         "order_id":     order_id,
                         "placed_at":    time.time(),
-                        "cancel_at":    time.time() + CANCEL_AFTER,
                         "period_end":   current_period + 900,
                         "move_pct":     round(move * 100, 3),
                         "btc_at_entry": ws_feed.get("BTC"),
@@ -609,14 +742,16 @@ async def main():
                     open_trades.append(trade)
                     state["trades"].append(trade)
                     fired_this_period.add(coin)
+                    active_positions += 1
                     save_state(state)
 
                     logger.info("CERTAINTY_TRADE",
                                 coin=coin.upper(), side=side,
                                 move="%.3f%%" % (move * 100),
-                                entry_price=entry_price,
-                                size_usd=round(size_usd, 2),
-                                tokens=round(tokens, 2),
+                                requested_price=entry_price,
+                                fill_price=fill_price,
+                                size_usd=actual_size,
+                                tokens=filled_tokens,
                                 elapsed=elapsed,
                                 bankroll=round(bankroll, 2),
                                 order_id=order_id[:16])

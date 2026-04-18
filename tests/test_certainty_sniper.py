@@ -5,7 +5,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from run_certainty_sniper import (
     kelly_size, gate1_move, gate2_confirm, compute_all_moves,
-    price_at_or_before,
+    price_at_or_before, target_size_usd, extract_fill_metrics,
     MIN_MOVE_PCT, CONFIRM_MOVE_PCT, MIN_CONFIRMING,
     BET_MIN, BET_MAX,
 )
@@ -107,3 +107,25 @@ def test_price_at_or_before():
     assert price_at_or_before(history, 115.0) == 1.1
     assert price_at_or_before(history, 120.0) == 1.2
     assert price_at_or_before(history, 90.0) is None
+
+
+def test_target_size_usd_respects_book_fraction():
+    assert target_size_usd(bankroll=200.0, ask_usd_vol=20.0, coin="btc") == 0.0
+
+
+def test_target_size_usd_skips_thin_book():
+    assert target_size_usd(bankroll=200.0, ask_usd_vol=5.0, coin="doge") == 0.0
+
+
+def test_extract_fill_metrics_from_explicit_values():
+    result = {"filledSize": "8.5", "avgPrice": "0.88"}
+    filled, price = extract_fill_metrics(result, requested_tokens=10.0, limit_price=0.89)
+    assert filled == 8.5
+    assert price == 0.88
+
+
+def test_extract_fill_metrics_from_status_fallback():
+    result = {"status": "filled"}
+    filled, price = extract_fill_metrics(result, requested_tokens=10.0, limit_price=0.89)
+    assert filled == 10.0
+    assert price == 0.89

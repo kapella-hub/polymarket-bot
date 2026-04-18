@@ -95,6 +95,10 @@
   .footer { padding: 14px 0 8px; font-size: 0.68em; color: var(--text-dim); text-align: center; }
   .empty { text-align: center; padding: 24px; color: var(--text-dim); font-size: 0.85em; }
   .pos-profit { font-size: 0.75em; color: var(--text-dim); }
+  .mini-grid { display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; margin-top:12px; }
+  .mini-stat { background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px; text-align:center; }
+  .mini-num { font-size: 1.05em; font-weight: 800; color: var(--text-bright); }
+  .mini-label { font-size: 0.63em; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-dim); margin-top: 2px; }
   @media (max-width: 640px) { body { padding: 14px; } .hero-value { font-size: 2em; } .grid-3 { grid-template-columns: 1fr 1fr; } .capital-row { grid-template-columns: 1fr 1fr; } }
 </style>
 </head>
@@ -279,6 +283,7 @@ function render() {
   // ── Certainty Sniper ──────────────────────────
   const cs = D.certainty_sniper || {};
   if (cs.bankroll > 0 || (cs.recent_trades||[]).length) {
+    const analytics = cs.analytics || {};
     const csSection = el('div', 'section');
     csSection.append(el('div', 'section-title', 'Certainty Sniper — Late-Period'));
     const csCard = el('div', 'card');
@@ -297,6 +302,31 @@ function render() {
     csBkEl.textContent = usd(cs.bankroll) + '  ·  ' + cs.wins + 'W/' + (cs.losses||0) + 'L  ·  P&L ' + (cs.pnl >= 0 ? '+' : '') + usd(cs.pnl||0) + '  ·  win ' + (cs.win_rate||'--');
     csCard.append(kvRow('Status', csStatusBadge));
     csCard.append(kvRow('Bankroll', csBkEl));
+    if ((analytics.attempts||0) > 0) {
+      const csExecEl = el('span');
+      csExecEl.textContent = (analytics.attempts||0) + ' attempts  Â·  any fill ' + Math.round((analytics.any_fill_rate||0) * 100) + '%  Â·  full fill ' + Math.round((analytics.full_fill_rate||0) * 100) + '%';
+      csCard.append(kvRow('Execution', csExecEl));
+
+      const csQualityEl = el('span');
+      csQualityEl.textContent = 'avg slip ' + ((analytics.avg_slippage||0) >= 0 ? '+' : '') + Number(analytics.avg_slippage||0).toFixed(4)
+        + '  Â·  settled WR ' + Math.round((analytics.settled_win_rate||0) * 100) + '%'
+        + ((analytics.worst_coin||'') ? '  Â·  weakest ' + String(analytics.worst_coin).toUpperCase() : '');
+      csCard.append(kvRow('Quality', csQualityEl));
+
+      const mini = el('div', 'mini-grid');
+      function miniStat(num, label) {
+        const card = el('div', 'mini-stat');
+        card.append(el('div', 'mini-num', num));
+        card.append(el('div', 'mini-label', label));
+        return card;
+      }
+      mini.append(
+        miniStat(String(analytics.attempts||0), 'Attempts'),
+        miniStat(Math.round((analytics.any_fill_rate||0) * 100) + '%', 'Any Fill'),
+        miniStat(Math.round((analytics.full_fill_rate||0) * 100) + '%', 'Full Fill')
+      );
+      csCard.append(mini);
+    }
     csSection.append(csCard);
     app.append(csSection);
 
