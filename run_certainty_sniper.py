@@ -19,8 +19,10 @@ import json
 import os
 import sys
 import time
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -30,9 +32,16 @@ load_dotenv(Path(__file__).parent / '.env')
 import httpx
 import structlog
 
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
-from py_clob_client.order_builder.constants import BUY
+try:
+    from py_clob_client.client import ClobClient
+    from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
+    from py_clob_client.order_builder.constants import BUY
+except ImportError:
+    ClobClient = Any
+    ApiCreds = None
+    OrderArgs = None
+    OrderType = None
+    BUY = None
 from src.crypto_arb.ws_feeds import BinanceWSFeed
 
 logger = structlog.get_logger()
@@ -69,6 +78,7 @@ CIRCUIT_LOSSES    = 2     # Consecutive losses before pause
 CIRCUIT_SKIP      = 4     # Periods to skip after circuit triggers
 DAILY_LOSS_PCT    = 0.12  # 12% daily loss → halt for 24h
 MIN_BANKROLL      = 30.0  # Stop trading below this
+PRICE_HISTORY_SEC = 1800  # Keep enough Binance ticks to resolve prior periods accurately
 
 
 def kelly_size(bankroll: float, win_rate: float = 0.90, avg_entry: float = 0.85) -> float:
@@ -111,7 +121,20 @@ def compute_all_moves(ws_feed: BinanceWSFeed, period_prices: dict[str, float]) -
     return moves
 
 
+def price_at_or_before(history: deque, target_ts: float) -> float | None:
+    """Return the most recent observed price at or before the target timestamp."""
+    best = None
+    for ts, price in history:
+        if ts <= target_ts:
+            best = price
+        else:
+            break
+    return best
+
+
 def create_clob() -> ClobClient:
+    if ApiCreds is None:
+        raise RuntimeError("py_clob_client is not installed")
     creds = ApiCreds(
         api_key=os.getenv('PM_POLYMARKET_API_KEY'),
         api_secret=os.getenv('PM_POLYMARKET_API_SECRET'),
@@ -226,6 +249,8 @@ async def fetch_market_price(client: httpx.AsyncClient, coin: str, period_ts: in
 async def place_order(loop, clob: ClobClient, token_id: str,
                       entry_price: float, tokens: float) -> str:
     """Place a FAK buy order. Fills immediately or auto-cancels. Returns order_id or ''."""
+    if OrderArgs is None or OrderType is None or BUY is None:
+        raise RuntimeError("py_clob_client is not installed")
     try:
         order_args = OrderArgs(
             token_id=token_id,
@@ -290,6 +315,7 @@ async def main():
     hist_start: dict[int, dict[str, float]] = {}
     open_trades: list[dict] = [t for t in state.get("trades", [])
                                 if t.get("status") in ("placed", "pending_settlement")]
+    rolling_prices: dict[str, deque] = {asset: deque() for asset in COIN_TO_ASSET.values()}
     fired_this_period: set[str] = set()
     last_skip_period = 0
     last_check_ts = 0
@@ -301,6 +327,18 @@ async def main():
             now_ts    = int(time.time())
             period_ts = (now_ts // 900) * 900
             elapsed   = now_ts - period_ts
+            now_f     = time.time()
+
+            # Maintain a rolling Binance price tape so settlement uses the price at cutoff.
+            for asset in COIN_TO_ASSET.values():
+                px = ws_feed.get(asset)
+                if not px:
+                    continue
+                history = rolling_prices[asset]
+                history.append((now_f, px))
+                cutoff_ts = now_f - PRICE_HISTORY_SEC
+                while history and history[0][0] < cutoff_ts:
+                    history.popleft()
 
             # ── NEW PERIOD ────────────────────────────────────
             if period_ts != current_period:
@@ -352,7 +390,6 @@ async def main():
                 last_status = now_ts
 
             # ── CANCEL UNFILLED ORDERS ────────────────────────
-            now_f = time.time()
             for trade in list(open_trades):
                 if trade["status"] != "placed":
                     continue
@@ -383,9 +420,9 @@ async def main():
                 t_per = trade["period"]
 
                 start_p = hist_start.get(t_per, {}).get(asset)
-                end_p   = ws_feed.get(asset)
+                end_p   = price_at_or_before(rolling_prices.get(asset, deque()), trade["period_end"])
 
-                if not start_p:
+                if not start_p or end_p is None:
                     trade["status"] = "pending_settlement"
                     continue
 
@@ -509,16 +546,15 @@ async def main():
 
                     side      = "buy_up" if direction == "up" else "buy_down"
                     token_id  = market["up_token_id"] if direction == "up" else market["down_token_id"]
-                    raw_price = market["up_price"] if direction == "up" else market["down_price"]
-                    entry_price = round(min(raw_price + 0.01, 0.99), 4)
-
                     # Gate 4: CLOB book must have enough liquidity to fill
                     clob_ask, ask_usd_vol = await get_clob_ask(http, token_id)
-                    if ask_usd_vol < MIN_BOOK_VOLUME:
+                    if clob_ask <= 0 or ask_usd_vol < MIN_BOOK_VOLUME:
                         logger.info("certainty_skip_thin_book",
                                     coin=coin, ask_vol_usd=round(ask_usd_vol, 1))
                         fired_this_period.add(coin)
                         continue
+
+                    entry_price = round(clob_ask, 4)
 
                     if entry_price > MAX_ENTRY_PRICE:
                         logger.info("certainty_skip",

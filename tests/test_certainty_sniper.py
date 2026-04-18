@@ -1,9 +1,11 @@
 import sys
+from collections import deque
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from run_certainty_sniper import (
     kelly_size, gate1_move, gate2_confirm, compute_all_moves,
+    price_at_or_before,
     MIN_MOVE_PCT, CONFIRM_MOVE_PCT, MIN_CONFIRMING,
     BET_MIN, BET_MAX,
 )
@@ -81,9 +83,9 @@ def test_compute_all_moves_missing_price():
 
 
 def test_kelly_size_unclamped():
-    # bankroll=120 puts raw half-Kelly size ~within [8, 40], pins actual formula output
+    # bankroll=120 would size above the hard 15% bankroll cap, so it clamps to $18.
     size = kelly_size(bankroll=120.0)
-    assert abs(size - 20.0) < 0.10  # formula gives bankroll * ~16.67%
+    assert abs(size - 18.0) < 0.10
 
 
 def test_gate1_move_none_price():
@@ -94,3 +96,14 @@ def test_gate1_move_none_price():
 def test_gate2_confirm_down_fails():
     moves = {"btc": -0.009, "eth": -0.002, "sol": 0.001, "xrp": 0.001, "doge": 0.001, "bnb": 0.003}
     assert gate2_confirm(moves, "down") is False  # only btc <=-0.5% down
+
+
+def test_price_at_or_before():
+    history = deque([
+        (100.0, 1.0),
+        (110.0, 1.1),
+        (120.0, 1.2),
+    ])
+    assert price_at_or_before(history, 115.0) == 1.1
+    assert price_at_or_before(history, 120.0) == 1.2
+    assert price_at_or_before(history, 90.0) is None

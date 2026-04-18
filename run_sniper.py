@@ -85,6 +85,7 @@ CONTINUATION_MAX_ENTRY_PRICE        = 0.88
 # Lower depth floor for continuation: position size is 0.55x (~$8-13), not burst's $8-25.
 # Observed 2026-04-18 11:40 UTC: BTC -0.378%, ETH -0.498% clean signal blocked by $20 floor.
 CONTINUATION_MIN_BOOK_VOLUME        = 10.0
+PRICE_HISTORY_SEC                   = 1800
 
 
 def _get_price_at(history: deque, target_ts: float) -> float | None:
@@ -276,7 +277,10 @@ async def main():
     fired_this_period: set[str] = set()
 
     # Continuation mode state
-    _roll_max_age = CONTINUATION_LOOKBACK_SEC + CONTINUATION_REVERSAL_WINDOW_SEC + 30
+    _roll_max_age = max(
+        CONTINUATION_LOOKBACK_SEC + CONTINUATION_REVERSAL_WINDOW_SEC + 30,
+        PRICE_HISTORY_SEC,
+    )
     rolling_prices: dict[str, deque] = {a: deque() for a in COIN_TO_ASSET.values()}
     continuation_trades_this_period = 0
     last_continuation_period        = 0
@@ -647,9 +651,9 @@ async def main():
                 t_per  = trade["period"]
 
                 start_p = hist_start.get(t_per, {}).get(asset)
-                end_p   = ws_feed.get(asset)
+                end_p   = _get_price_at(rolling_prices.get(asset, deque()), trade["period_end"])
 
-                if not start_p:
+                if not start_p or end_p is None:
                     trade["status"] = "pending_settlement"
                     continue
 
