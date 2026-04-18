@@ -48,30 +48,39 @@ logger = structlog.get_logger()
 
 LOG_FILE   = Path(__file__).parent / "certainty_sniper_output.log"
 STATE_FILE = Path(__file__).parent / "data" / "certainty_sniper_state.json"
+FILL_LOG_FILE = Path(__file__).parent / "data" / "certainty_fill_journal.jsonl"
 
 COINS         = ["btc", "eth", "sol", "xrp", "doge", "bnb"]
 COIN_TO_ASSET = {"btc": "BTC", "eth": "ETH", "sol": "SOL",
                  "xrp": "XRP", "doge": "DOGE", "bnb": "BNB"}
-# Only trade coins with enough CLOB liquidity to support late-period entries
-LIQUID_COINS  = frozenset(["btc"])
+BOOK_MIN_BY_COIN = {
+    "btc": 20.0,
+    "eth": 16.0,
+    "sol": 14.0,
+    "xrp": 10.0,
+    "doge": 10.0,
+    "bnb": 10.0,
+}
 
 # Timing
 CERTAINTY_START  = 720   # 12 min into period — start checking
-CERTAINTY_END    = 780   # 13 min into period — stop (2 min remaining, avoid liquidity desert)
+CERTAINTY_END    = 840   # 14 min into period — keep a wider window and let scoring reject poor late entries
 CHECK_INTERVAL   = 30    # Check every 30s in window
-CANCEL_AFTER     = 5     # Cancel unfilled order quickly — need fill before period ends
-MIN_BOOK_VOLUME  = 20.0  # Min USD resting at best ask on CLOB before placing
+MAX_OPEN_TRADES  = 2     # Avoid over-concentrating when multiple coins fire together
 
 # Signal thresholds
-MIN_MOVE_PCT       = 0.007  # Gate 1: target coin moved >=0.7%
-CONFIRM_MOVE_PCT   = 0.005  # Gate 2: confirming coins moved >=0.5%
-MIN_CONFIRMING     = 2      # Gate 2: need >=2 confirming coins
+MIN_MOVE_PCT       = 0.0055  # Base move gate; effective threshold tightens/loosens with elapsed time
+CONFIRM_MOVE_PCT   = 0.0035  # Base confirm threshold; breadth is scored, not just hard-filtered
+MIN_CONFIRMING     = 2       # Includes the target coin
 MAX_ENTRY_PRICE    = 0.92   # Skip if market already priced certainty in
+MIN_SIGNAL_SCORE   = 1.75   # Minimum composite score to trade
 
 # Sizing
 BET_MIN              = 8.0
 BET_MAX              = 40.0
 MAX_BET_PCT_BANKROLL = 0.15   # Hard ceiling — guards against over-optimistic win_rate
+BOOK_TAKE_PCT        = 0.35   # Only lean on a fraction of visible asks to reduce FAK misses
+MAX_TRADES_PER_COIN_PER_DAY = 8
 
 # Risk controls
 CIRCUIT_LOSSES    = 2     # Consecutive losses before pause
@@ -110,6 +119,13 @@ def gate2_confirm(all_moves: dict[str, float], target_direction: str) -> bool:
     return confirming >= MIN_CONFIRMING
 
 
+def gate2_confirm_count(all_moves: dict[str, float], target_direction: str) -> int:
+    """Return the number of confirming coins, including the target coin."""
+    if target_direction == "up":
+        return sum(1 for m in all_moves.values() if m >= CONFIRM_MOVE_PCT)
+    return sum(1 for m in all_moves.values() if m <= -CONFIRM_MOVE_PCT)
+
+
 def compute_all_moves(ws_feed: BinanceWSFeed, period_prices: dict[str, float]) -> dict[str, float]:
     """Compute move fraction for each coin from period open. Returns {coin: move_fraction}."""
     moves = {}
@@ -130,6 +146,48 @@ def price_at_or_before(history: deque, target_ts: float) -> float | None:
         else:
             break
     return best
+
+
+def certainty_move_threshold(elapsed: int) -> float:
+    """Relax the move threshold later in the period when certainty is cheaper to infer."""
+    progress = min(max((elapsed - CERTAINTY_START) / max(CERTAINTY_END - CERTAINTY_START, 1), 0.0), 1.0)
+    return MIN_MOVE_PCT - 0.0015 * progress
+
+
+def certainty_confirm_threshold(elapsed: int) -> float:
+    """Relax breadth slightly later in the period to keep the strategy active in quieter tapes."""
+    progress = min(max((elapsed - CERTAINTY_START) / max(CERTAINTY_END - CERTAINTY_START, 1), 0.0), 1.0)
+    return CONFIRM_MOVE_PCT - 0.0010 * progress
+
+
+def orderbook_imbalance(bid_vol: float, ask_vol: float, direction: str) -> float:
+    """Signed [0, 1] pressure score for the target direction."""
+    total = bid_vol + ask_vol
+    if total <= 0:
+        return 0.0
+    raw = (bid_vol - ask_vol) / total
+    return raw if direction == "up" else -raw
+
+
+def certainty_signal_score(
+    move_abs: float,
+    move_threshold: float,
+    confirm_count: int,
+    imbalance: float,
+    entry_price: float,
+    ask_usd_vol: float,
+    elapsed: int,
+) -> float:
+    """Composite score balancing directional certainty, breadth, execution, and timeliness."""
+    if move_threshold <= 0 or entry_price <= 0:
+        return 0.0
+    move_score = move_abs / move_threshold
+    breadth_score = max(0.0, confirm_count - 1) * 0.35
+    imbalance_score = max(0.0, imbalance) * 2.0
+    price_score = max(0.0, (MAX_ENTRY_PRICE - entry_price) / 0.10)
+    liquidity_score = min(ask_usd_vol / 40.0, 1.0) * 0.35
+    time_bonus = min(max((elapsed - CERTAINTY_START) / 120.0, 0.0), 1.0) * 0.15
+    return move_score + breadth_score + imbalance_score + price_score + liquidity_score + time_bonus
 
 
 def create_clob() -> ClobClient:
@@ -172,9 +230,102 @@ def save_state(state: dict) -> None:
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
-async def gate3_orderbook(client: httpx.AsyncClient, coin: str, direction: str) -> bool:
-    """Gate 3: Binance top-10 order book confirms continued pressure in direction.
-    UP move: bid volume > ask volume. DOWN move: ask volume > bid volume."""
+def append_fill_journal(entry: dict) -> None:
+    FILL_LOG_FILE.parent.mkdir(exist_ok=True)
+    with FILL_LOG_FILE.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, sort_keys=True) + "\n")
+
+
+def coin_book_min_usd(coin: str) -> float:
+    return BOOK_MIN_BY_COIN.get(coin, min(BOOK_MIN_BY_COIN.values()))
+
+
+def count_coin_trades_today(trades: list[dict], coin: str, today: str) -> int:
+    count = 0
+    for trade in trades:
+        if trade.get("coin") != coin:
+            continue
+        placed_at = trade.get("placed_at")
+        if not placed_at:
+            continue
+        try:
+            trade_day = datetime.fromtimestamp(float(placed_at), tz=timezone.utc).date().isoformat()
+        except (TypeError, ValueError, OSError):
+            continue
+        if trade_day == today:
+            count += 1
+    return count
+
+
+def target_size_usd(bankroll: float, ask_usd_vol: float, coin: str) -> float:
+    """Size by bankroll, then clip to a fraction of visible ask liquidity."""
+    base_size = min(kelly_size(bankroll), bankroll - 5)
+    book_limited = ask_usd_vol * BOOK_TAKE_PCT
+    coin_min = coin_book_min_usd(coin)
+    if ask_usd_vol < coin_min:
+        return 0.0
+    if book_limited < BET_MIN:
+        return 0.0
+    return min(base_size, BET_MAX, round(book_limited, 2))
+
+
+def _coerce_float(value: Any) -> float | None:
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def extract_fill_metrics(result: dict, requested_tokens: float, limit_price: float) -> tuple[float, float]:
+    """Best-effort parse of filled tokens / average price from exchange response."""
+    token_candidates = (
+        result.get("filledSize"),
+        result.get("filled_size"),
+        result.get("sizeMatched"),
+        result.get("size_matched"),
+        result.get("matchedSize"),
+        result.get("matched_size"),
+        result.get("takerFillSize"),
+        result.get("makerFillSize"),
+    )
+    filled_tokens = next((v for v in (_coerce_float(x) for x in token_candidates) if v and v > 0), None)
+    if filled_tokens is None:
+        status = str(result.get("status", "")).lower()
+        if status in {"filled", "matched"}:
+            filled_tokens = requested_tokens
+        else:
+            filled_tokens = 0.0
+
+    price_candidates = (
+        result.get("avgPrice"),
+        result.get("avg_price"),
+        result.get("price"),
+        result.get("matchedPrice"),
+        result.get("matched_price"),
+    )
+    avg_price = next((v for v in (_coerce_float(x) for x in price_candidates) if v and v > 0), None)
+    if avg_price is None:
+        spent_candidates = (
+            result.get("filledValue"),
+            result.get("filled_value"),
+            result.get("takingAmount"),
+            result.get("taking_amount"),
+            result.get("matchedAmount"),
+            result.get("matched_amount"),
+        )
+        spent = next((v for v in (_coerce_float(x) for x in spent_candidates) if v and v > 0), None)
+        if spent is not None and filled_tokens > 0:
+            avg_price = spent / filled_tokens
+
+    if avg_price is None or avg_price <= 0:
+        avg_price = limit_price
+    return round(filled_tokens, 4), round(avg_price, 4)
+
+
+async def gate3_orderbook(client: httpx.AsyncClient, coin: str) -> tuple[float, float]:
+    """Return Binance top-10 bid/ask depth totals for pressure scoring."""
     symbol = COIN_TO_ASSET[coin] + "USDT"
     try:
         resp = await client.get(
@@ -185,13 +336,10 @@ async def gate3_orderbook(client: httpx.AsyncClient, coin: str, direction: str) 
         data = resp.json()
         bid_vol = sum(float(qty) for _, qty in data.get("bids", []))
         ask_vol = sum(float(qty) for _, qty in data.get("asks", []))
-        if direction == "up":
-            return bid_vol > ask_vol
-        else:
-            return ask_vol > bid_vol
+        return bid_vol, ask_vol
     except Exception as e:
         logger.debug("orderbook_error", coin=coin, error=str(e))
-        return False  # fail safe: skip if can't check
+        return 0.0, 0.0
 
 
 async def get_clob_ask(client: httpx.AsyncClient, token_id: str) -> tuple[float, float]:
@@ -247,8 +395,8 @@ async def fetch_market_price(client: httpx.AsyncClient, coin: str, period_ts: in
 
 
 async def place_order(loop, clob: ClobClient, token_id: str,
-                      entry_price: float, tokens: float) -> str:
-    """Place a FAK buy order. Fills immediately or auto-cancels. Returns order_id or ''."""
+                      entry_price: float, tokens: float) -> dict:
+    """Place a FAK buy order and return the raw exchange response plus parsed fill metrics."""
     if OrderArgs is None or OrderType is None or BUY is None:
         raise RuntimeError("py_clob_client is not installed")
     try:
@@ -261,19 +409,22 @@ async def place_order(loop, clob: ClobClient, token_id: str,
         signed = await loop.run_in_executor(None, clob.create_order, order_args)
         result = await loop.run_in_executor(
             None, functools.partial(clob.post_order, signed, OrderType.FAK))
-        return result.get("orderID", "")
+        order_id = result.get("orderID", result.get("id", ""))
+        filled_tokens, avg_price = extract_fill_metrics(result, tokens, entry_price)
+        return {
+            "order_id": order_id,
+            "filled_tokens": filled_tokens,
+            "avg_price": avg_price,
+            "raw": result,
+        }
     except Exception as e:
         logger.error("place_order_error", error=str(e)[:120])
-        return ""
-
-
-async def cancel_order(loop, clob: ClobClient, order_id: str) -> bool:
-    try:
-        await loop.run_in_executor(None, functools.partial(clob.cancel, order_id))
-        return True
-    except Exception as e:
-        logger.debug("cancel_error", order_id=order_id[:16], error=str(e))
-        return False
+        return {
+            "order_id": "",
+            "filled_tokens": 0.0,
+            "avg_price": entry_price,
+            "raw": {"error": str(e)[:240]},
+        }
 
 
 async def main():
@@ -389,25 +540,6 @@ async def main():
                             circuit="skip%d" % skip_signals if skip_signals else "ok")
                 last_status = now_ts
 
-            # ── CANCEL UNFILLED ORDERS ────────────────────────
-            for trade in list(open_trades):
-                if trade["status"] != "placed":
-                    continue
-                if now_f < trade.get("cancel_at", float("inf")):
-                    continue
-                cancelled = await cancel_order(loop, clob, trade["order_id"])
-                if cancelled:
-                    bankroll += trade["size_usd"]
-                    state["bankroll"] = bankroll
-                    trade["status"] = "cancelled"
-                    trade["pnl"]    = 0
-                    save_state(state)
-                    logger.info("CERTAINTY_CANCELLED",
-                                coin=trade["coin"].upper(),
-                                order_id=trade["order_id"][:16])
-                else:
-                    trade["cancel_at"] = now_f + 15
-
             # ── RESOLVE TRADES (period_end + 120s grace) ──────
             for trade in list(open_trades):
                 if trade["status"] != "placed":
@@ -509,36 +641,50 @@ async def main():
                 last_check_ts = now_ts
                 period_prices = hist_start.get(current_period, {})
                 all_moves     = compute_all_moves(ws_feed, period_prices)
+                active_positions = sum(1 for t in open_trades if t["status"] == "placed")
+                today = datetime.now(timezone.utc).date().isoformat()
+                move_gate = certainty_move_threshold(elapsed)
+                confirm_gate = certainty_confirm_threshold(elapsed)
+                candidates: list[dict] = []
 
                 for coin in COINS:
-                    if coin not in LIQUID_COINS:
-                        continue
                     if coin in fired_this_period:
+                        continue
+                    if active_positions >= MAX_OPEN_TRADES:
+                        break
+                    if count_coin_trades_today(state["trades"], coin, today) >= MAX_TRADES_PER_COIN_PER_DAY:
+                        logger.info("certainty_skip_daily_coin_cap", coin=coin, cap=MAX_TRADES_PER_COIN_PER_DAY)
+                        fired_this_period.add(coin)
                         continue
 
                     move = all_moves.get(coin, 0.0)
-                    passed_g1, _ = gate1_move(
+                    passed_g1, move_fraction = gate1_move(
                         cur=ws_feed.get(COIN_TO_ASSET[coin]),
                         start=period_prices.get(COIN_TO_ASSET[coin]),
                     )
-                    if not passed_g1:
+                    if not passed_g1 or abs(move_fraction) < move_gate:
                         continue
 
                     direction = "up" if move > 0 else "down"
-                    if not gate2_confirm(all_moves, direction):
+                    adjusted_moves = {
+                        c: m for c, m in all_moves.items()
+                        if (m >= confirm_gate if direction == "up" else m <= -confirm_gate)
+                    }
+                    confirm_count = len(adjusted_moves)
+                    if confirm_count < MIN_CONFIRMING:
                         continue
 
-                    # Gate 3 — order book (async, with timeout guard)
+                    # Gate 3 — order book contributes to score rather than acting as a single hard cliff.
                     try:
-                        ob_ok = await asyncio.wait_for(
-                            gate3_orderbook(http, coin, direction), timeout=3)
+                        bid_vol, ask_vol = await asyncio.wait_for(
+                            gate3_orderbook(http, coin), timeout=3)
                     except asyncio.TimeoutError:
-                        ob_ok = False
-                    if not ob_ok:
+                        bid_vol, ask_vol = 0.0, 0.0
+                    imbalance = orderbook_imbalance(bid_vol, ask_vol, direction)
+                    if imbalance <= -0.10:
                         logger.debug("certainty_skip_gate3", coin=coin, move="%.3f%%" % (move * 100))
                         continue
 
-                    # All 3 gates passed — fetch fresh market price
                     market = await fetch_market_price(http, coin, current_period)
                     if not market:
                         logger.warning("certainty_no_market", coin=coin)
@@ -546,11 +692,12 @@ async def main():
 
                     side      = "buy_up" if direction == "up" else "buy_down"
                     token_id  = market["up_token_id"] if direction == "up" else market["down_token_id"]
-                    # Gate 4: CLOB book must have enough liquidity to fill
                     clob_ask, ask_usd_vol = await get_clob_ask(http, token_id)
-                    if clob_ask <= 0 or ask_usd_vol < MIN_BOOK_VOLUME:
+                    min_book_usd = coin_book_min_usd(coin)
+                    if clob_ask <= 0 or ask_usd_vol < min_book_usd:
                         logger.info("certainty_skip_thin_book",
-                                    coin=coin, ask_vol_usd=round(ask_usd_vol, 1))
+                                    coin=coin, ask_vol_usd=round(ask_usd_vol, 1),
+                                    min_book_usd=min_book_usd)
                         fired_this_period.add(coin)
                         continue
 
@@ -563,25 +710,121 @@ async def main():
                         fired_this_period.add(coin)
                         continue
 
-                    size_usd = min(kelly_size(bankroll), bankroll - 5)
+                    size_usd = target_size_usd(bankroll, ask_usd_vol, coin)
                     if size_usd < BET_MIN:
+                        logger.info("certainty_skip_small_size",
+                                    coin=coin,
+                                    ask_vol_usd=round(ask_usd_vol, 1),
+                                    target_size=round(size_usd, 2))
                         continue
 
-                    # Cap tokens to available CLOB volume so FAK fills fully
-                    available_tokens = ask_usd_vol / entry_price
+                    # Cap to a fraction of visible depth; FAK should not assume we own the whole level.
+                    available_tokens = (ask_usd_vol * BOOK_TAKE_PCT) / entry_price
                     tokens = min(size_usd / entry_price, available_tokens)
                     actual_size = round(tokens * entry_price, 2)
+                    if actual_size < BET_MIN:
+                        logger.info("certainty_skip_fractional_depth",
+                                    coin=coin,
+                                    ask_vol_usd=round(ask_usd_vol, 1),
+                                    take_pct=BOOK_TAKE_PCT)
+                        fired_this_period.add(coin)
+                        continue
+
+                    score = certainty_signal_score(
+                        move_abs=abs(move_fraction),
+                        move_threshold=move_gate,
+                        confirm_count=confirm_count,
+                        imbalance=imbalance,
+                        entry_price=entry_price,
+                        ask_usd_vol=ask_usd_vol,
+                        elapsed=elapsed,
+                    )
+                    if score < MIN_SIGNAL_SCORE:
+                        logger.debug(
+                            "certainty_skip_low_score",
+                            coin=coin,
+                            score=round(score, 3),
+                            move=round(move_fraction * 100, 3),
+                            confirm_count=confirm_count,
+                            imbalance=round(imbalance, 3),
+                            entry_price=entry_price,
+                        )
+                        continue
+
+                    candidates.append({
+                        "coin": coin,
+                        "direction": direction,
+                        "side": side,
+                        "move": move,
+                        "entry_price": entry_price,
+                        "size_usd": size_usd,
+                        "ask_usd_vol": ask_usd_vol,
+                        "tokens": tokens,
+                        "actual_size": actual_size,
+                        "market": market,
+                        "token_id": token_id,
+                        "confirm_count": confirm_count,
+                        "score": score,
+                        "imbalance": imbalance,
+                    })
+
+                candidates.sort(key=lambda c: (c["score"], c["ask_usd_vol"], -c["entry_price"]), reverse=True)
+
+                for candidate in candidates[: max(MAX_OPEN_TRADES - active_positions, 0)]:
+                    coin = candidate["coin"]
+                    side = candidate["side"]
+                    direction = candidate["direction"]
+                    move = candidate["move"]
+                    entry_price = candidate["entry_price"]
+                    size_usd = candidate["size_usd"]
+                    ask_usd_vol = candidate["ask_usd_vol"]
+                    tokens = candidate["tokens"]
+                    actual_size = candidate["actual_size"]
+                    market = candidate["market"]
+                    token_id = candidate["token_id"]
+                    confirm_count = candidate["confirm_count"]
+                    score = candidate["score"]
 
                     logger.info("certainty_signal",
-                                coin=coin, direction=direction,
+                                coin=coin,
+                                direction=direction,
                                 move="%.3f%%" % (move * 100),
                                 entry_price=entry_price,
                                 size_usd=actual_size,
                                 ask_vol=round(ask_usd_vol, 1),
+                                confirm_count=confirm_count,
+                                score=round(score, 3),
                                 elapsed=elapsed)
 
-                    order_id = await place_order(loop, clob, token_id, entry_price, tokens)
-                    if not order_id:
+                    order = await place_order(loop, clob, token_id, entry_price, tokens)
+                    filled_tokens = order["filled_tokens"]
+                    fill_price = order["avg_price"]
+                    actual_size = round(filled_tokens * fill_price, 2)
+                    order_id = order["order_id"]
+
+                    append_fill_journal({
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "coin": coin,
+                        "side": side,
+                        "period": current_period,
+                        "token_id": token_id,
+                        "requested_tokens": round(tokens, 4),
+                        "requested_price": entry_price,
+                        "requested_notional": round(tokens * entry_price, 2),
+                        "filled_tokens": filled_tokens,
+                        "fill_price": fill_price,
+                        "filled_notional": actual_size,
+                        "ask_usd_vol": round(ask_usd_vol, 2),
+                        "raw": order["raw"],
+                    })
+
+                    if not order_id or filled_tokens <= 0 or actual_size < 1.0:
+                        logger.info("certainty_unfilled",
+                                    coin=coin,
+                                    requested_tokens=round(tokens, 2),
+                                    order_id=(order_id[:16] if order_id else ""),
+                                    filled_tokens=filled_tokens)
+                        fired_this_period.add(coin)
                         continue
 
                     bankroll -= actual_size
@@ -594,14 +837,17 @@ async def main():
                         "side":         side,
                         "token_id":     token_id,
                         "condition_id": market["condition_id"],
-                        "entry_price":  entry_price,
+                        "entry_price":  fill_price,
                         "size_usd":     actual_size,
-                        "tokens":       round(tokens, 4),
+                        "requested_entry_price": entry_price,
+                        "requested_tokens": round(tokens, 4),
+                        "tokens":       filled_tokens,
                         "order_id":     order_id,
                         "placed_at":    time.time(),
-                        "cancel_at":    time.time() + CANCEL_AFTER,
                         "period_end":   current_period + 900,
                         "move_pct":     round(move * 100, 3),
+                        "confirm_count": confirm_count,
+                        "signal_score": round(score, 3),
                         "btc_at_entry": ws_feed.get("BTC"),
                         "status":       "placed",
                         "pnl":          0,
@@ -609,14 +855,16 @@ async def main():
                     open_trades.append(trade)
                     state["trades"].append(trade)
                     fired_this_period.add(coin)
+                    active_positions += 1
                     save_state(state)
 
                     logger.info("CERTAINTY_TRADE",
                                 coin=coin.upper(), side=side,
                                 move="%.3f%%" % (move * 100),
-                                entry_price=entry_price,
-                                size_usd=round(size_usd, 2),
-                                tokens=round(tokens, 2),
+                                requested_price=entry_price,
+                                fill_price=fill_price,
+                                size_usd=actual_size,
+                                tokens=filled_tokens,
                                 elapsed=elapsed,
                                 bankroll=round(bankroll, 2),
                                 order_id=order_id[:16])

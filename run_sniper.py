@@ -53,6 +53,7 @@ COIN_TO_ASSET = {"btc": "BTC", "eth": "ETH", "sol": "SOL",
                  "xrp": "XRP", "doge": "DOGE", "bnb": "BNB"}
 
 # Core parameters
+ENABLE_BOUNDARY_SNIPER = False  # Historical state shows cancels with no realized edge; continuation is preferred
 SNIPE_WINDOW     = 90     # Fire within first N seconds of period start
 MIN_MOVE_PCT     = 0.004  # 0.40% minimum move to signal (stronger conviction)
 MAX_ENTRY_PRICE  = 0.72   # Skip if best ask > this (EV floor: need <73.5% break-even)
@@ -73,8 +74,8 @@ ENABLE_CONTINUATION_SHADOW          = False   # Redundant when live is on
 CONTINUATION_ACTIVE_START_SEC       = 240     # Minute 4
 CONTINUATION_ACTIVE_END_SEC         = 600     # Minute 10 (>=5min hold before period end)
 CONTINUATION_LOOKBACK_SEC           = 300     # 5-min rolling
-CONTINUATION_BTC_MIN_MOVE_PCT       = 0.0025  # 0.25% (relaxed from 0.30% — sweep shows +25% daily EV)
-CONTINUATION_ETH_MIN_MOVE_PCT       = 0.002   # 0.20% (relaxed from 0.25%)
+CONTINUATION_BTC_MIN_MOVE_PCT       = 0.0018  # 0.18%; rely on ranking and entry discipline instead of a single hard cliff
+CONTINUATION_ETH_MIN_MOVE_PCT       = 0.0015  # 0.15%
 CONTINUATION_REVERSAL_WINDOW_SEC    = 60
 CONTINUATION_REVERSAL_BLOCK_PCT     = 0.0012  # 0.12% peak-to-current counter-move
 CONTINUATION_SIZE_MULT              = 0.55
@@ -86,6 +87,7 @@ CONTINUATION_MAX_ENTRY_PRICE        = 0.88
 # Observed 2026-04-18 11:40 UTC: BTC -0.378%, ETH -0.498% clean signal blocked by $20 floor.
 CONTINUATION_MIN_BOOK_VOLUME        = 10.0
 PRICE_HISTORY_SEC                   = 1800
+CONTINUATION_MIN_SCORE              = 1.20
 
 
 def _get_price_at(history: deque, target_ts: float) -> float | None:
@@ -122,6 +124,21 @@ def _reversal_counter_move(history: deque, now_ts: float, window_sec: int,
     if direction == "up":
         return max(0.0, (max(recent) - p_now) / p_now)
     return max(0.0, (p_now - min(recent)) / p_now)
+
+
+def continuation_signal_score(
+    lead_move_abs: float,
+    confirm_move_abs: float,
+    reversal: float,
+    entry_price: float,
+    ask_usd_vol: float,
+) -> float:
+    move_score = (lead_move_abs / max(CONTINUATION_BTC_MIN_MOVE_PCT, 1e-9)) * 0.7
+    confirm_score = (confirm_move_abs / max(CONTINUATION_ETH_MIN_MOVE_PCT, 1e-9)) * 0.5
+    reversal_penalty = reversal / max(CONTINUATION_REVERSAL_BLOCK_PCT, 1e-9)
+    entry_score = max(0.0, (CONTINUATION_MAX_ENTRY_PRICE - entry_price) / 0.10)
+    liquidity_score = min(ask_usd_vol / 25.0, 1.0) * 0.35
+    return move_score + confirm_score + entry_score + liquidity_score - reversal_penalty
 
 
 def create_clob():
@@ -361,7 +378,7 @@ async def main():
             # ──────────────────────────────────────────────────
             # SNIPE WINDOW: first SNIPE_WINDOW seconds
             # ──────────────────────────────────────────────────
-            if 2 <= elapsed <= SNIPE_WINDOW and skip_signals == 0 and current_markets:
+            if ENABLE_BOUNDARY_SNIPER and 2 <= elapsed <= SNIPE_WINDOW and skip_signals == 0 and current_markets:
                 open_count = sum(1 for t in open_trades if t["status"] == "placed")
 
                 if open_count < MAX_CONCURRENT:
@@ -534,96 +551,117 @@ async def main():
                     if rev >= CONTINUATION_REVERSAL_BLOCK_PCT:
                         skip_reason = "reversal_block"
                     else:
-                        coin = "btc"
-                        market = current_markets.get(coin)
-                        if not market:
-                            skip_reason = "no_market"
-                        else:
+                        lead_move = abs(btc_move) if abs(btc_move) >= abs(eth_move) else abs(eth_move)
+                        confirm_move = min(abs(btc_move), abs(eth_move))
+                        candidates = []
+                        for coin, lead_abs in (("btc", abs(btc_move)), ("eth", abs(eth_move))):
+                            market = current_markets.get(coin)
+                            if not market:
+                                continue
                             side = "buy_up" if direction == "up" else "buy_down"
                             token_id = market["up_token_id"] if direction == "up" else market["down_token_id"]
                             best_ask, ask_usd_vol = await get_clob_ask(http, token_id)
                             if ask_usd_vol < CONTINUATION_MIN_BOOK_VOLUME:
-                                skip_reason = "depth_fail"
+                                continue
+                            entry_price = best_ask if best_ask > 0 else (
+                                market["up_price"] if direction == "up" else market["down_price"])
+                            if entry_price > CONTINUATION_MAX_ENTRY_PRICE:
+                                continue
+                            score = continuation_signal_score(
+                                lead_move_abs=lead_abs,
+                                confirm_move_abs=confirm_move,
+                                reversal=rev,
+                                entry_price=entry_price,
+                                ask_usd_vol=ask_usd_vol,
+                            )
+                            if score < CONTINUATION_MIN_SCORE:
+                                continue
+                            candidates.append((score, coin, market, side, token_id, entry_price, ask_usd_vol))
+
+                        if not candidates:
+                            skip_reason = "no_ranked_candidate"
+                        elif sum(1 for t in open_trades if t.get("status") == "placed") >= MAX_CONCURRENT:
+                            skip_reason = "max_concurrent_reached"
+                        else:
+                            candidates.sort(key=lambda x: (x[0], x[6], -x[5]), reverse=True)
+                            score, coin, market, side, token_id, entry_price, ask_usd_vol = candidates[0]
+                            base_size = min(BET_MAX, max(BET_MIN, bankroll * BET_PCT))
+                            size = base_size * CONTINUATION_SIZE_MULT
+                            if size < BET_MIN:
+                                skip_reason = "size_below_min"
+                            elif size > bankroll - 5:
+                                skip_reason = "bankroll_guard"
                             else:
-                                entry_price = best_ask if best_ask > 0 else (
-                                    market["up_price"] if direction == "up" else market["down_price"])
-                                if entry_price > CONTINUATION_MAX_ENTRY_PRICE:
-                                    skip_reason = "price_cap_fail"
-                                elif sum(1 for t in open_trades if t.get("status") == "placed") >= MAX_CONCURRENT:
-                                    skip_reason = "max_concurrent_reached"
-                                else:
-                                    base_size = min(BET_MAX, max(BET_MIN, bankroll * BET_PCT))
-                                    size = base_size * CONTINUATION_SIZE_MULT
-                                    if size < BET_MIN:
-                                        skip_reason = "size_below_min"
-                                    elif size > bankroll - 5:
-                                        skip_reason = "bankroll_guard"
-                                    else:
-                                        tokens = min(size / entry_price, ask_usd_vol / entry_price)
-                                        actual_size = round(tokens * entry_price, 2)
-                                        if ENABLE_CONTINUATION_MODE:
-                                            try:
-                                                order_args = OrderArgs(
-                                                    token_id=token_id,
-                                                    price=round(entry_price, 4),
-                                                    size=round(tokens, 2),
-                                                    side=BUY,
-                                                )
-                                                signed = await loop.run_in_executor(
-                                                    None, clob.create_order, order_args)
-                                                result = await loop.run_in_executor(
-                                                    None, functools.partial(clob.post_order, signed, OrderType.FAK))
-                                                order_id = result.get("orderID", "")
-                                                if order_id:
-                                                    bankroll -= actual_size
-                                                    state["bankroll"] = bankroll
-                                                    state["total_invested"] = state.get("total_invested", 0) + actual_size
-                                                    trade = {
-                                                        "period":       period_ts,
-                                                        "coin":         coin,
-                                                        "side":         side,
-                                                        "token_id":     token_id,
-                                                        "condition_id": market["condition_id"],
-                                                        "entry_price":  round(entry_price, 4),
-                                                        "size_usd":     actual_size,
-                                                        "tokens":       round(tokens, 2),
-                                                        "order_id":     order_id,
-                                                        "placed_at":    now_f,
-                                                        "period_end":   period_ts + 900,
-                                                        "move_pct":     round(btc_move * 100, 3),
-                                                        "cross_confirm": 2,
-                                                        "btc_at_entry": ws_feed.get("BTC"),
-                                                        "strategy_mode": "continuation",
-                                                        "status":       "placed",
-                                                        "pnl":          0,
-                                                    }
-                                                    open_trades.append(trade)
-                                                    state["trades"].append(trade)
-                                                    continuation_trades_this_period += 1
-                                                    save_state(state)
-                                                    logger.info("CONT_LIVE_FIRE",
-                                                                period=period_ts, elapsed=elapsed,
-                                                                direction=direction,
-                                                                btc_move=round(btc_move * 100, 3),
-                                                                eth_move=round(eth_move * 100, 3),
-                                                                entry=round(entry_price, 4),
-                                                                size=actual_size,
-                                                                order_id=order_id[:16],
-                                                                bankroll=round(bankroll, 2))
-                                                else:
-                                                    skip_reason = "no_order_id"
-                                            except Exception as e:
-                                                skip_reason = "order_error"
-                                                logger.error("CONT_ORDER_ERROR", error=str(e)[:120])
-                                        else:
+                                tokens = min(size / entry_price, ask_usd_vol / entry_price)
+                                actual_size = round(tokens * entry_price, 2)
+                                if ENABLE_CONTINUATION_MODE:
+                                    try:
+                                        order_args = OrderArgs(
+                                            token_id=token_id,
+                                            price=round(entry_price, 4),
+                                            size=round(tokens, 2),
+                                            side=BUY,
+                                        )
+                                        signed = await loop.run_in_executor(
+                                            None, clob.create_order, order_args)
+                                        result = await loop.run_in_executor(
+                                            None, functools.partial(clob.post_order, signed, OrderType.FAK))
+                                        order_id = result.get("orderID", "")
+                                        if order_id:
+                                            bankroll -= actual_size
+                                            state["bankroll"] = bankroll
+                                            state["total_invested"] = state.get("total_invested", 0) + actual_size
+                                            trade = {
+                                                "period":       period_ts,
+                                                "coin":         coin,
+                                                "side":         side,
+                                                "token_id":     token_id,
+                                                "condition_id": market["condition_id"],
+                                                "entry_price":  round(entry_price, 4),
+                                                "size_usd":     actual_size,
+                                                "tokens":       round(tokens, 2),
+                                                "order_id":     order_id,
+                                                "placed_at":    now_f,
+                                                "period_end":   period_ts + 900,
+                                                "move_pct":     round((btc_move if coin == 'btc' else eth_move) * 100, 3),
+                                                "cross_confirm": 2,
+                                                "btc_at_entry": ws_feed.get("BTC"),
+                                                "strategy_mode": "continuation",
+                                                "signal_score": round(score, 3),
+                                                "status":       "placed",
+                                                "pnl":          0,
+                                            }
+                                            open_trades.append(trade)
+                                            state["trades"].append(trade)
                                             continuation_trades_this_period += 1
-                                            logger.info("CONT_SHADOW_FIRE",
+                                            save_state(state)
+                                            logger.info("CONT_LIVE_FIRE",
                                                         period=period_ts, elapsed=elapsed,
                                                         direction=direction,
+                                                        asset=coin.upper(),
                                                         btc_move=round(btc_move * 100, 3),
                                                         eth_move=round(eth_move * 100, 3),
                                                         entry=round(entry_price, 4),
-                                                        size=actual_size)
+                                                        size=actual_size,
+                                                        score=round(score, 3),
+                                                        order_id=order_id[:16],
+                                                        bankroll=round(bankroll, 2))
+                                        else:
+                                            skip_reason = "no_order_id"
+                                    except Exception as e:
+                                        skip_reason = "order_error"
+                                        logger.error("CONT_ORDER_ERROR", error=str(e)[:120])
+                                else:
+                                    continuation_trades_this_period += 1
+                                    logger.info("CONT_SHADOW_FIRE",
+                                                period=period_ts, elapsed=elapsed,
+                                                direction=direction,
+                                                asset=coin.upper(),
+                                                btc_move=round(btc_move * 100, 3),
+                                                eth_move=round(eth_move * 100, 3),
+                                                entry=round(entry_price, 4),
+                                                size=actual_size,
+                                                score=round(score, 3))
 
                 # Log skip once per minute bucket (dedup across 0.1s loop ticks)
                 if skip_reason:

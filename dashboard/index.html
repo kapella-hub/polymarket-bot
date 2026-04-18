@@ -95,6 +95,10 @@
   .footer { padding: 14px 0 8px; font-size: 0.68em; color: var(--text-dim); text-align: center; }
   .empty { text-align: center; padding: 24px; color: var(--text-dim); font-size: 0.85em; }
   .pos-profit { font-size: 0.75em; color: var(--text-dim); }
+  .mini-grid { display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; margin-top:12px; }
+  .mini-stat { background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px; text-align:center; }
+  .mini-num { font-size: 1.05em; font-weight: 800; color: var(--text-bright); }
+  .mini-label { font-size: 0.63em; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-dim); margin-top: 2px; }
   @media (max-width: 640px) { body { padding: 14px; } .hero-value { font-size: 2em; } .grid-3 { grid-template-columns: 1fr 1fr; } .capital-row { grid-template-columns: 1fr 1fr; } }
 </style>
 </head>
@@ -143,6 +147,8 @@ function render() {
   const sn  = D.sniper        || {};
   const walletUsdc = D.wallet_usdc || 0;
   const positions  = D.open_positions || [];
+  const cs = D.certainty_sniper || {};
+  const allocations = D.strategy_allocations || [];
 
   const gtaPaid      = positions.reduce((s,p) => s + (p.size||0), 0);
   const gtaPotential = positions.reduce((s,p) => s + (p.tokens||0) * 0.90, 0);
@@ -188,9 +194,34 @@ function render() {
   );
   app.append(capRow);
 
-  // ── Momentum Sniper ───────────────────────────
+  // ── Strategy Allocation ──────────────────────
+  if (allocations.length) {
+    const allocSection = el('div', 'section');
+    allocSection.append(el('div', 'section-title', 'Strategy Allocation'));
+    for (const a of allocations) {
+      const item = el('div', 'pos-item');
+      const left = el('div', 'pos-left');
+      left.append(el('div', 'pos-name', a.strategy || 'Strategy'));
+      left.append(el('div', 'pos-detail',
+        'bankroll ' + usd(a.bankroll||0) +
+        ' · deployed ' + usd(a.deployed||0) +
+        ' · open ' + (a.open_trades||0) +
+        ' · closed ' + (a.closed_trades||0)));
+      item.append(left);
+      const right = el('div', 'pos-right');
+      const pnlNum = Number(a.realized_pnl||0);
+      right.append(el('div', 'pos-value ' + (pnlNum >= 0 ? 'pos' : 'neg'),
+        (pnlNum >= 0 ? '+' : '') + usd(pnlNum)));
+      right.append(el('div', 'pos-profit', 'realized pnl'));
+      item.append(right);
+      allocSection.append(item);
+    }
+    app.append(allocSection);
+  }
+
+  // ── Intraday Sniper ───────────────────────────
   const snSection = el('div', 'section');
-  snSection.append(el('div', 'section-title', 'Momentum Sniper — 6 Coins'));
+  snSection.append(el('div', 'section-title', 'Intraday Sniper — Continuation Priority'));
   const snCard = el('div', 'card');
 
   function kvRow(label, valueNode) {
@@ -208,12 +239,20 @@ function render() {
   let snStatusBadge;
   if (circuitStr.startsWith('PAUSED')) {
     snStatusBadge = badge(circuitStr, 'badge-red');
-  } else if (elapsed <= 90) {
-    snStatusBadge = badge('Snipe Window (' + elapsed + 's)', 'badge-amber');
+  } else if (elapsed >= 240 && elapsed <= 600) {
+    snStatusBadge = badge('Continuation Window (' + elapsed + 's)', 'badge-amber');
+  } else if (sn.boundary_enabled && elapsed <= 90) {
+    snStatusBadge = badge('Boundary Window (' + elapsed + 's)', 'badge-amber');
   } else {
-    snStatusBadge = badge('Waiting for next period', 'badge-blue');
+    snStatusBadge = badge('Waiting for ranked setup', 'badge-blue');
   }
-  snCard.append(kvRow('Strategy', 'Buy momentum within first 90s · entry $0.52 · 6 coins'));
+  const stratWrap = el('span');
+  stratWrap.append(
+    badge(sn.continuation_enabled ? 'Continuation On' : 'Continuation Off', sn.continuation_enabled ? 'badge-green' : 'badge-grey'),
+    document.createTextNode(' '),
+    badge(sn.boundary_enabled ? 'Boundary On' : 'Boundary Off', sn.boundary_enabled ? 'badge-amber' : 'badge-grey')
+  );
+  snCard.append(kvRow('Mode', stratWrap));
   snCard.append(kvRow('Status', snStatusBadge));
 
   const pnlSpan = el('span', pnl >= 0 ? 'pos' : 'neg', (pnl>=0?'+':'') + usd(pnl));
@@ -222,10 +261,15 @@ function render() {
   snCard.append(kvRow('Bankroll', bkRow));
 
   const periodRow = el('span');
-  periodRow.textContent = elapsed <= 90
-    ? ('⚡ SNIPE WINDOW — ' + elapsed + 's elapsed')
-    : (remM + 'm ' + remS + 's until next window');
+  periodRow.textContent = (elapsed >= 240 && elapsed <= 600)
+    ? ('Continuation eval live — ' + elapsed + 's elapsed')
+    : (remM + 'm ' + remS + 's to next reset');
   snCard.append(kvRow('Period', periodRow));
+
+  const recentSkip = (sn.recent_skips||[]).slice(-1)[0];
+  if (recentSkip && recentSkip.reason) {
+    snCard.append(kvRow('Latest Skip', (recentSkip.reason || 'n/a').replaceAll('_',' ')));
+  }
 
   // Progress bar — highlights snipe window in green, rest in grey
   const progWrap = el('div'); progWrap.style.cssText = 'margin-top:10px;height:5px;border-radius:3px;background:var(--surface-2);overflow:hidden';
@@ -237,11 +281,30 @@ function render() {
   snSection.append(snCard);
   app.append(snSection);
 
+  // ── Recent continuation fires ─────────────────
+  const recentContinuation = (sn.recent_continuation||[]).slice(-5);
+  if (recentContinuation.length) {
+    const contSection = el('div', 'section');
+    contSection.append(el('div', 'section-title', 'Recent Continuation Orders'));
+    for (const t of recentContinuation.slice().reverse()) {
+      const item = el('div', 'pos-item');
+      const left = el('div', 'pos-left');
+      const asset = (t.asset || t.coin || '?').toUpperCase();
+      left.append(el('div', 'pos-name', asset + ' ' + (t.direction||'')));
+      left.append(el('div', 'pos-detail',
+        'btc ' + (t.btc_move||'?') + '% · eth ' + (t.eth_move||'?') + '% · entry ' + usd(parseFloat(t.entry||0)) + ' · score ' + (t.score||'--')));
+      item.append(left);
+      item.append(badge('Continuation', 'badge-purple'));
+      contSection.append(item);
+    }
+    app.append(contSection);
+  }
+
   // ── Recent sniper fires ───────────────────────
   const recentFires = (sn.recent_trades||[]).slice(-5);
   if (recentFires.length) {
     const fireSection = el('div', 'section');
-    fireSection.append(el('div', 'section-title', 'Recent Snipe Orders'));
+    fireSection.append(el('div', 'section-title', 'Boundary Orders'));
     for (const t of recentFires.slice().reverse()) {
       const item = el('div', 'pos-item');
       const left = el('div', 'pos-left');
@@ -277,8 +340,8 @@ function render() {
   }
 
   // ── Certainty Sniper ──────────────────────────
-  const cs = D.certainty_sniper || {};
   if (cs.bankroll > 0 || (cs.recent_trades||[]).length) {
+    const analytics = cs.analytics || {};
     const csSection = el('div', 'section');
     csSection.append(el('div', 'section-title', 'Certainty Sniper — Late-Period'));
     const csCard = el('div', 'card');
@@ -297,6 +360,35 @@ function render() {
     csBkEl.textContent = usd(cs.bankroll) + '  ·  ' + cs.wins + 'W/' + (cs.losses||0) + 'L  ·  P&L ' + (cs.pnl >= 0 ? '+' : '') + usd(cs.pnl||0) + '  ·  win ' + (cs.win_rate||'--');
     csCard.append(kvRow('Status', csStatusBadge));
     csCard.append(kvRow('Bankroll', csBkEl));
+    if ((analytics.attempts||0) > 0) {
+      const csExecEl = el('span');
+      csExecEl.textContent = (analytics.attempts||0) + ' attempts  Â·  any fill ' + Math.round((analytics.any_fill_rate||0) * 100) + '%  Â·  full fill ' + Math.round((analytics.full_fill_rate||0) * 100) + '%';
+      csCard.append(kvRow('Execution', csExecEl));
+
+      const csQualityEl = el('span');
+      csQualityEl.textContent = 'avg slip ' + ((analytics.avg_slippage||0) >= 0 ? '+' : '') + Number(analytics.avg_slippage||0).toFixed(4)
+        + '  Â·  settled WR ' + Math.round((analytics.settled_win_rate||0) * 100) + '%'
+        + ((analytics.worst_coin||'') ? '  Â·  weakest ' + String(analytics.worst_coin).toUpperCase() : '');
+      csCard.append(kvRow('Quality', csQualityEl));
+
+      const scoreHint = el('span');
+      scoreHint.textContent = 'Ranked late-period entries · adaptive thresholds · best candidates only';
+      csCard.append(kvRow('Selection', scoreHint));
+
+      const mini = el('div', 'mini-grid');
+      function miniStat(num, label) {
+        const card = el('div', 'mini-stat');
+        card.append(el('div', 'mini-num', num));
+        card.append(el('div', 'mini-label', label));
+        return card;
+      }
+      mini.append(
+        miniStat(String(analytics.attempts||0), 'Attempts'),
+        miniStat(Math.round((analytics.any_fill_rate||0) * 100) + '%', 'Any Fill'),
+        miniStat(Math.round((analytics.full_fill_rate||0) * 100) + '%', 'Full Fill')
+      );
+      csCard.append(mini);
+    }
     csSection.append(csCard);
     app.append(csSection);
 
@@ -309,12 +401,29 @@ function render() {
         const left = el('div', 'pos-left');
         left.append(el('div', 'pos-name', (t.coin||'?').toUpperCase() + ' ' + (t.side||'')));
         left.append(el('div', 'pos-detail',
-          'move ' + (t.move||'?') + ' · entry ' + usd(parseFloat(t.entry_price||0)) + ' · size ' + usd(parseFloat(t.size_usd||0))));
+          'move ' + (t.move||'?') + ' · entry ' + usd(parseFloat(t.entry_price||0)) + ' · size ' + usd(parseFloat(t.size_usd||0))
+          + (t.score ? ' · score ' + t.score : '') + (t.confirm_count ? ' · breadth ' + t.confirm_count : '')));
         item.append(left);
         item.append(t.status === 'cancelled' ? badge('Cancelled', 'badge-grey') : badge('Placed', 'badge-amber'));
         csFireSection.append(item);
       }
       app.append(csFireSection);
+    }
+
+    const csSkips = (cs.recent_skips||[]).slice(-5);
+    if (csSkips.length) {
+      const csSkipSection = el('div', 'section');
+      csSkipSection.append(el('div', 'section-title', 'Recent Certainty Skips'));
+      for (const t of csSkips.slice().reverse()) {
+        const item = el('div', 'pos-item');
+        const left = el('div', 'pos-left');
+        left.append(el('div', 'pos-name', ((t.coin||'MARKET').toUpperCase()) + ' skip'));
+        left.append(el('div', 'pos-detail', (t.reason || 'unknown').replaceAll('_',' ')));
+        item.append(left);
+        item.append(badge('Skip', 'badge-grey'));
+        csSkipSection.append(item);
+      }
+      app.append(csSkipSection);
     }
 
     const csResolved = (cs.recent_resolved||[]).slice(-8);

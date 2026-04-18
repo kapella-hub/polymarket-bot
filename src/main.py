@@ -1,9 +1,13 @@
 """FastAPI application with lifespan-managed background services."""
 
 import asyncio
+import csv
+import io
+import json
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 
 import structlog
 from fastapi import FastAPI
@@ -40,6 +44,163 @@ _ensemble: EnsembleEngine | None = None
 _executor: ExecutionEngine | None = None
 _nexus: NexusClient | None = None
 _shutdown_event = asyncio.Event()
+
+
+def _to_float(value) -> float:
+    try:
+        if value is None or value == "":
+            return 0.0
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _signal_is_tradeable(signal, now: datetime | None = None) -> bool:
+    if signal is None:
+        return False
+    now = now or datetime.now(timezone.utc)
+    expires_at = getattr(signal, "expires_at", None)
+    if expires_at is None:
+        return True
+    return expires_at > now
+
+
+def _position_mark_price(position, markets_by_id: dict) -> float:
+    market = markets_by_id.get(position.market_id)
+    if market is None:
+        return position.avg_entry_price
+
+    outcome = (position.outcome or "").lower()
+    if outcome == "no":
+        if market.best_ask is not None and market.best_ask > 0:
+            return max(0.0, min(1.0, 1.0 - market.best_ask))
+        if market.last_price is not None and market.last_price > 0:
+            return max(0.0, min(1.0, 1.0 - market.last_price))
+        if market.best_bid is not None and market.best_bid > 0:
+            return max(0.0, min(1.0, 1.0 - market.best_bid))
+        return position.avg_entry_price
+
+    if market.best_bid is not None and market.best_bid > 0:
+        return market.best_bid
+    if market.last_price is not None and market.last_price > 0:
+        return market.last_price
+    if market.best_ask is not None and market.best_ask > 0:
+        return market.best_ask
+    return position.avg_entry_price
+
+
+def _compute_portfolio_value(positions: list, markets: list, bankroll_usd: float) -> float:
+    markets_by_id = {m.id: m for m in markets}
+    total_cost_basis = sum(max(p.cost_basis, 0.0) for p in positions)
+    marked_value = sum(
+        max(p.size, 0.0) * _position_mark_price(p, markets_by_id)
+        for p in positions
+    )
+    cash = bankroll_usd - total_cost_basis
+    return cash + marked_value
+
+
+def _load_certainty_analytics(base: Path) -> dict:
+    fill_path = base / "data" / "certainty_fill_journal.jsonl"
+    state_path = base / "data" / "certainty_sniper_state.json"
+
+    fills = []
+    if fill_path.exists():
+        for line in fill_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                fills.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+    trades = []
+    if state_path.exists():
+        try:
+            trades = json.loads(state_path.read_text(encoding="utf-8")).get("trades", [])
+        except json.JSONDecodeError:
+            trades = []
+
+    trades_by_order = {
+        t.get("order_id"): t
+        for t in trades
+        if t.get("order_id")
+    }
+
+    rows = []
+    for fill in fills:
+        raw = fill.get("raw", {}) if isinstance(fill.get("raw"), dict) else {}
+        order_id = fill.get("order_id") or raw.get("orderID") or raw.get("id")
+        trade = trades_by_order.get(order_id, {})
+        rows.append({
+            "coin": fill.get("coin", ""),
+            "order_id": order_id or "",
+            "requested_price": _to_float(fill.get("requested_price")),
+            "fill_price": _to_float(fill.get("fill_price")),
+            "requested_notional": _to_float(fill.get("requested_notional")),
+            "filled_notional": _to_float(fill.get("filled_notional")),
+            "requested_tokens": _to_float(fill.get("requested_tokens")),
+            "filled_tokens": _to_float(fill.get("filled_tokens")),
+            "ask_usd_vol": _to_float(fill.get("ask_usd_vol")),
+            "status": trade.get("status", ""),
+            "pnl": _to_float(trade.get("pnl")),
+        })
+
+    attempts = len(rows)
+    any_fill = sum(1 for row in rows if row["filled_notional"] > 0)
+    full_fill = sum(
+        1
+        for row in rows
+        if row["requested_tokens"] > 0
+        and row["filled_tokens"] >= row["requested_tokens"] * 0.999
+    )
+    slippages = [
+        row["fill_price"] - row["requested_price"]
+        for row in rows
+        if row["filled_notional"] > 0 and row["requested_price"] > 0 and row["fill_price"] > 0
+    ]
+    settled = [row for row in rows if row["status"] in ("won", "lost")]
+    wins = sum(1 for row in settled if row["status"] == "won")
+
+    by_coin: dict[str, dict] = {}
+    for row in rows:
+        coin = row["coin"] or "unknown"
+        stats = by_coin.setdefault(
+            coin,
+            {"attempts": 0, "any_fill": 0, "full_fill": 0, "settled": 0, "wins": 0, "pnl": 0.0}
+        )
+        stats["attempts"] += 1
+        if row["filled_notional"] > 0:
+            stats["any_fill"] += 1
+        if row["requested_tokens"] > 0 and row["filled_tokens"] >= row["requested_tokens"] * 0.999:
+            stats["full_fill"] += 1
+        if row["status"] in ("won", "lost"):
+            stats["settled"] += 1
+            stats["wins"] += int(row["status"] == "won")
+            stats["pnl"] += row["pnl"]
+
+    worst_coin = None
+    if by_coin:
+        worst_coin = min(
+            by_coin.items(),
+            key=lambda kv: (
+                (kv[1]["any_fill"] / kv[1]["attempts"]) if kv[1]["attempts"] else 1.0,
+                kv[1]["pnl"],
+            ),
+        )[0]
+
+    return {
+        "attempts": attempts,
+        "any_fill_rate": (any_fill / attempts) if attempts else 0.0,
+        "full_fill_rate": (full_fill / attempts) if attempts else 0.0,
+        "avg_slippage": (sum(slippages) / len(slippages)) if slippages else 0.0,
+        "settled_win_rate": (wins / len(settled)) if settled else 0.0,
+        "settled_count": len(settled),
+        "worst_coin": worst_coin or "",
+        "by_coin": by_coin,
+        "rows": rows,
+    }
 
 
 async def _discovery_loop() -> None:
@@ -166,6 +327,8 @@ async def _strategy_loop() -> None:
 
                 for market in tradeable:
                     signal = await signal_repo.get_latest(market.id)
+                    if not _signal_is_tradeable(signal):
+                        signal = None
 
                     # Build context for alphas
                     ctx = {"signal": signal}
@@ -195,9 +358,11 @@ async def _strategy_loop() -> None:
 
                 # Update portfolio value for drawdown tracking
                 if positions:
-                    portfolio_val = sum(
-                        abs(p.size * p.avg_entry_price) for p in positions
-                    ) + settings.bankroll_usd
+                    portfolio_val = _compute_portfolio_value(
+                        positions,
+                        markets,
+                        settings.bankroll_usd,
+                    )
                     _executor._risk.update_portfolio_value(portfolio_val)
 
         except Exception as e:
@@ -554,12 +719,19 @@ async def all_status():
     result = {
         "sniper": {"bankroll": 0, "pnl": 0, "trades": 0, "wins": 0, "losses": 0,
                    "win_rate": "--", "open": 0, "btc": 0, "period_elapsed": "",
-                   "circuit": "ok", "recent_trades": [], "recent_resolved": []},
+                   "circuit": "ok", "recent_trades": [], "recent_resolved": [],
+                   "boundary_enabled": False, "continuation_enabled": True,
+                   "recent_continuation": [], "recent_skips": []},
         "certainty_sniper": {"bankroll": 0, "pnl": 0, "wins": 0, "losses": 0,
                              "win_rate": "--", "open": 0, "btc": 0, "period_elapsed": "",
-                             "circuit": "ok", "recent_trades": [], "recent_resolved": []},
+                             "circuit": "ok", "recent_trades": [], "recent_resolved": [],
+                             "recent_skips": [],
+                             "analytics": {"attempts": 0, "any_fill_rate": 0, "full_fill_rate": 0,
+                                           "avg_slippage": 0, "settled_win_rate": 0,
+                                           "settled_count": 0, "worst_coin": "", "by_coin": {}}},
         "open_positions": [],
         "wallet_usdc": 0,
+        "strategy_allocations": [],
         "ai_monitor": {"status": "none", "summary": "", "issues": "", "timestamp": ""},
     }
 
@@ -579,6 +751,8 @@ async def all_status():
             lines = slog.read_text().strip().split("\n")
             trades = []
             resolved = []
+            continuation = []
+            recent_skips = []
             latest = {}
             skip_remaining = 0
             cancelled_ids: set = set()
@@ -592,6 +766,10 @@ async def all_status():
                     cancelled_ids.add(p.get("order_id", ""))
                 elif "SNIPER_RESOLVED" in line:
                     resolved.append(_parse(line))
+                elif "CONT_LIVE_FIRE" in line or "CONT_SHADOW_FIRE" in line:
+                    continuation.append(_parse(line))
+                elif "CONT_SKIP" in line:
+                    recent_skips.append(_parse(line))
                 elif "CIRCUIT_BREAKER" in line and "TICK" not in line:
                     p = _parse(line)
                     skip_remaining = int(p.get("skipping_next", 4))
@@ -622,6 +800,8 @@ async def all_status():
                 "skip_remaining": skip_remaining,
                 "recent_trades": trades[-10:],
                 "recent_resolved": resolved[-10:],
+                "recent_continuation": continuation[-10:],
+                "recent_skips": recent_skips[-10:],
             }
         except Exception:
             pass
@@ -633,6 +813,7 @@ async def all_status():
             lines = cslog.read_text().strip().split("\n")
             cs_trades = []
             cs_resolved = []
+            cs_skips = []
             cs_latest = {}
             cs_cancelled_ids: set = set()
             for line in lines[-1000:]:
@@ -640,6 +821,8 @@ async def all_status():
                     cs_latest = _parse(line)
                 elif "CERTAINTY_TRADE" in line:
                     cs_trades.append(_parse(line))
+                elif "certainty_skip" in line or "certainty_skip_" in line:
+                    cs_skips.append(_parse(line))
                 elif "CERTAINTY_CANCELLED" in line:
                     p = _parse(line)
                     cs_cancelled_ids.add(p.get("order_id", ""))
@@ -665,9 +848,18 @@ async def all_status():
                 "circuit": cs_latest.get("circuit", "ok"),
                 "recent_trades": cs_trades[-10:],
                 "recent_resolved": cs_resolved[-10:],
+                "recent_skips": cs_skips[-10:],
+                "analytics": result["certainty_sniper"]["analytics"],
             }
         except Exception:
             pass
+
+    try:
+        result["certainty_sniper"]["analytics"] = {
+            k: v for k, v in _load_certainty_analytics(base).items() if k != "rows"
+        }
+    except Exception:
+        pass
 
     # --- Open long-term positions (from legacy power_trade_state.json) ---
     pt_state = base / "data" / "power_trade_state.json"
@@ -717,7 +909,103 @@ async def all_status():
         except Exception:
             pass
 
+    def _status_num(x):
+        try:
+            return float(x)
+        except Exception:
+            try:
+                return float(str(x).replace("$", "").replace("+", ""))
+            except Exception:
+                return 0.0
+
+    def _load_state_summary(path, label, open_statuses, closed_statuses):
+        if not path.exists():
+            return None
+        try:
+            state = jsonmod.loads(path.read_text())
+        except Exception:
+            return None
+        trades = state.get("trades", [])
+        open_trades = [t for t in trades if t.get("status") in open_statuses]
+        closed_trades = [t for t in trades if t.get("status") in closed_statuses]
+        realized_pnl = sum(
+            float(t.get("pnl", 0) or 0)
+            for t in closed_trades
+            if isinstance(t.get("pnl", 0), (int, float)) or str(t.get("pnl", 0)).replace(".", "", 1).replace("-", "", 1).isdigit()
+        )
+        deployed = sum(float(t.get("size_usd", 0) or 0) for t in open_trades)
+        return {
+            "strategy": label,
+            "bankroll": float(state.get("bankroll", 0) or 0),
+            "deployed": deployed,
+            "open_trades": len(open_trades),
+            "closed_trades": len(closed_trades),
+            "realized_pnl": realized_pnl,
+        }
+
+    allocations = []
+    sniper_alloc = _load_state_summary(
+        base / "data" / "sniper_state.json",
+        "Intraday Sniper",
+        {"placed", "pending_settlement"},
+        {"won", "lost", "cancelled", "expired"},
+    )
+    certainty_alloc = _load_state_summary(
+        base / "data" / "certainty_sniper_state.json",
+        "Certainty Sniper",
+        {"placed", "pending_settlement"},
+        {"won", "lost", "cancelled", "expired"},
+    )
+    contrarian_alloc = _load_state_summary(
+        base / "data" / "contrarian_state.json",
+        "Contrarian",
+        {"placed", "open", "pending_settlement"},
+        {"won", "lost", "cancelled", "expired"},
+    )
+    daily_alloc = _load_state_summary(
+        base / "data" / "daily_compounder_state.json",
+        "Daily Compounder",
+        {"open", "placed", "pending_settlement"},
+        {"won", "lost", "cancelled", "expired"},
+    )
+    for item in (certainty_alloc, sniper_alloc, contrarian_alloc, daily_alloc):
+        if item is not None:
+            allocations.append(item)
+    result["strategy_allocations"] = allocations
+
     return result
+
+
+@app.get("/api/certainty-report.csv")
+async def certainty_report_csv():
+    base = Path(__file__).parent.parent
+    analytics = _load_certainty_analytics(base)
+    output = io.StringIO()
+    writer = csv.DictWriter(
+        output,
+        fieldnames=[
+            "coin",
+            "order_id",
+            "requested_price",
+            "fill_price",
+            "requested_notional",
+            "filled_notional",
+            "requested_tokens",
+            "filled_tokens",
+            "ask_usd_vol",
+            "status",
+            "pnl",
+        ],
+    )
+    writer.writeheader()
+    for row in analytics["rows"]:
+        writer.writerow(row)
+
+    return Response(
+        content=output.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=certainty-report.csv"},
+    )
 
 
 @app.get("/api/ai-monitor")

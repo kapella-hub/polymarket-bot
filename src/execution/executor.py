@@ -8,9 +8,9 @@ import structlog
 from src.config import ExecutionMode, settings
 from src.db.database import async_session
 from src.db.models import InvalidationReason, OrderSide, StrategyMode
-from src.db.repositories import PositionRepository, TradeRepository
+from src.db.repositories import MarketRepository, PositionRepository, TradeRepository
 from src.ensemble.strategies import TradeDecision
-from src.exchange.base import ExchangeAdapter
+from src.exchange.base import ExchangeAdapter, TradeRecord
 from src.execution.intent import IntentManager
 from src.risk.controller import RiskCheck, RiskController
 
@@ -73,6 +73,44 @@ class ExecutionEngine:
 
         return False
 
+    async def _resolve_outcome_name(self, decision: TradeDecision) -> str:
+        async with async_session() as session:
+            market_repo = MarketRepository(session)
+            market = await market_repo.get_by_id(decision.market_id)
+
+        if market is None:
+            return "Unknown"
+        if decision.token_id == market.clob_token_id_yes:
+            return market.outcome_yes
+        if decision.token_id == market.clob_token_id_no:
+            return market.outcome_no
+        return "Unknown"
+
+    async def _get_fill_for_order(
+        self,
+        order_id: str,
+    ) -> tuple[float, float, float]:
+        if not self._exchange:
+            return 0.0, 0.0, 0.0
+
+        try:
+            trades = await self._exchange.get_trades()
+        except Exception:
+            return 0.0, 0.0, 0.0
+
+        matched: list[TradeRecord] = [t for t in trades if t.order_id == order_id]
+        if not matched:
+            return 0.0, 0.0, 0.0
+
+        filled_size = sum(t.size for t in matched)
+        if filled_size <= 0:
+            return 0.0, 0.0, 0.0
+
+        total_notional = sum(t.price * t.size for t in matched)
+        total_fee = sum(t.fee for t in matched)
+        avg_price = total_notional / filled_size if filled_size > 0 else 0.0
+        return filled_size, avg_price, total_fee
+
     async def _shadow_execute(
         self, intent_id: int, decision: TradeDecision, size: float
     ) -> bool:
@@ -86,6 +124,8 @@ class ExecutionEngine:
             size=f"${size:.2f}",
             strategy=decision.strategy.value,
         )
+        if not await self._intents.arm(intent_id, 0.0):
+            return False
         # Mark as executed for tracking (hypothetical)
         await self._intents.execute(
             intent_id,
@@ -131,30 +171,38 @@ class ExecutionEngine:
             size=f"${size:.2f}",
         )
 
+        token_qty = size / fill_price if fill_price > 0 else 0
+        if token_qty <= 0:
+            await self._intents.invalidate(
+                intent_id, InvalidationReason.RISK_LIMIT
+            )
+            return False
+
+        if not await self._intents.arm(intent_id, fill_price):
+            return False
         await self._intents.execute(
             intent_id,
             exchange_order_id=f"paper-{intent_id}",
             filled_price=fill_price,
-            filled_size=size,
+            filled_size=token_qty,
         )
 
         # Update position tracking
         async with async_session() as session:
             pos_repo = PositionRepository(session)
-            # Determine outcome name from token_id vs market
-            outcome = "Yes"  # Default, would need market lookup for accuracy
-            await pos_repo.upsert_from_fill(
+            outcome = await self._resolve_outcome_name(decision)
+            realized_pnl = await pos_repo.upsert_from_fill(
                 market_id=decision.market_id,
                 clob_token_id=decision.token_id,
                 outcome=outcome,
                 side=decision.side,
                 price=fill_price,
-                size=size / fill_price if fill_price > 0 else size,
+                size=token_qty,
             )
             await session.commit()
 
         # Track P&L for daily loss limit
-        self._risk.record_fill(0.0)  # Paper fills have no real P&L yet
+        self._risk.record_fill(realized_pnl)
 
         return True
 
@@ -198,7 +246,8 @@ class ExecutionEngine:
             return False
 
         # Arm the intent with the price
-        await self._intents.arm(intent_id, price)
+        if not await self._intents.arm(intent_id, price):
+            return False
 
         # Calculate token quantity from USDC size
         token_qty = size / price if price > 0 else 0
@@ -217,63 +266,84 @@ class ExecutionEngine:
         )
 
         if result.success:
+            filled_qty, filled_price, fee_paid = await self._get_fill_for_order(
+                result.order_id
+            )
+            if filled_qty <= 0 or filled_price <= 0:
+                cancelled = await self._exchange.cancel_order(result.order_id)
+                if cancelled:
+                    await self._intents.invalidate(
+                        intent_id, InvalidationReason.SPREAD_WIDENED
+                    )
+                else:
+                    logger.warning(
+                        "live_unconfirmed_order_left_open",
+                        intent_id=intent_id,
+                        order_id=result.order_id,
+                    )
+                return False
+
             await self._intents.execute(
                 intent_id,
                 exchange_order_id=result.order_id,
-                filled_price=price,
-                filled_size=token_qty,
+                filled_price=filled_price,
+                filled_size=filled_qty,
             )
 
             # Record trade
             async with async_session() as session:
                 trade_repo = TradeRepository(session)
                 pos_repo = PositionRepository(session)
+                outcome = await self._resolve_outcome_name(decision)
 
                 await trade_repo.record({
                     "market_id": decision.market_id,
                     "clob_token_id": decision.token_id,
                     "intent_id": intent_id,
                     "side": OrderSide.BUY if decision.side == "buy" else OrderSide.SELL,
-                    "price": price,
-                    "size": token_qty,
-                    "fee": 0.0,  # TODO: compute from exchange response
+                    "price": filled_price,
+                    "size": filled_qty,
+                    "fee": fee_paid,
                     "strategy": decision.strategy,
                     "exchange_order_id": result.order_id,
                     "executed_at": datetime.now(timezone.utc),
                 })
 
-                await pos_repo.upsert_from_fill(
+                realized_pnl = await pos_repo.upsert_from_fill(
                     market_id=decision.market_id,
                     clob_token_id=decision.token_id,
-                    outcome="Yes",
+                    outcome=outcome,
                     side=decision.side,
-                    price=price,
-                    size=token_qty,
+                    price=filled_price,
+                    size=filled_qty,
                 )
                 await session.commit()
 
-            # Track fill for risk — P&L computed on close, record 0 for open
-            self._risk.record_fill(0.0)
+            self._risk.record_fill(realized_pnl - fee_paid)
 
             logger.info(
                 "live_trade_executed",
                 intent_id=intent_id,
                 order_id=result.order_id,
-                price=price,
-                size=token_qty,
+                price=filled_price,
+                size=filled_qty,
             )
 
             # Push to NexusStack
             if self._nexus:
                 await self._nexus.event_trade_executed(
-                    decision.market_id, decision.side, size, price, decision.edge,
+                    decision.market_id,
+                    decision.side,
+                    filled_qty * filled_price,
+                    filled_price,
+                    decision.edge,
                 )
                 await self._nexus.learn_trade(
                     market_id=decision.market_id,
                     question="",  # Would need market question here
                     side=decision.side,
-                    size=size,
-                    price=price,
+                    size=filled_qty * filled_price,
+                    price=filled_price,
                     strategy=decision.strategy.value,
                     edge=decision.edge,
                 )

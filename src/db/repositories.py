@@ -170,8 +170,8 @@ class PositionRepository:
     async def upsert_from_fill(
         self, market_id: str, clob_token_id: str, outcome: str,
         side: str, price: float, size: float,
-    ) -> None:
-        """Update position from a trade fill."""
+    ) -> float:
+        """Update position from a trade fill and return realized P&L delta."""
         existing = await self.get_by_token(clob_token_id)
         if existing is None:
             pos = Position(
@@ -183,21 +183,24 @@ class PositionRepository:
                 cost_basis=price * size,
             )
             self.session.add(pos)
-        else:
-            if side == "buy":
-                new_size = existing.size + size
-                existing.cost_basis += price * size
-                existing.avg_entry_price = (
-                    existing.cost_basis / new_size if new_size > 0 else 0
-                )
-                existing.size = new_size
-            else:
-                # Clamp sell size to current position — prevent negative positions
-                sell_size = min(size, existing.size)
-                pnl = (price - existing.avg_entry_price) * sell_size
-                existing.realized_pnl += pnl
-                existing.size -= sell_size
-                existing.cost_basis = existing.avg_entry_price * existing.size
+            return 0.0
+
+        if side == "buy":
+            new_size = existing.size + size
+            existing.cost_basis += price * size
+            existing.avg_entry_price = (
+                existing.cost_basis / new_size if new_size > 0 else 0
+            )
+            existing.size = new_size
+            return 0.0
+
+        # Clamp sell size to current position — prevent negative positions
+        sell_size = min(size, existing.size)
+        pnl = (price - existing.avg_entry_price) * sell_size
+        existing.realized_pnl += pnl
+        existing.size -= sell_size
+        existing.cost_basis = existing.avg_entry_price * existing.size
+        return pnl
 
 
 class TradeRepository:

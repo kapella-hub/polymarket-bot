@@ -38,6 +38,7 @@ class RiskController:
 
     def __init__(self):
         self._peak_value: float = 0.0
+        self._current_value: float = 0.0
         self._daily_pnl: float = 0.0
         self._day_start: datetime = datetime.now(timezone.utc)
         self._lock = asyncio.Lock()
@@ -74,7 +75,12 @@ class RiskController:
         # 3. Portfolio exposure cap
         total_exposure = sum(abs(p.size * p.avg_entry_price) for p in positions)
         # Estimate portfolio value (exposure + remaining cash)
-        portfolio_value = max(total_exposure, self._peak_value) if self._peak_value > 0 else total_exposure + settings.bankroll_usd
+        if self._current_value > 0:
+            portfolio_value = self._current_value
+        elif self._peak_value > 0:
+            portfolio_value = max(total_exposure, self._peak_value)
+        else:
+            portfolio_value = total_exposure + settings.bankroll_usd
         max_exposure = portfolio_value * settings.max_portfolio_exposure_pct
         remaining_portfolio_cap = max_exposure - total_exposure
         if remaining_portfolio_cap <= 0:
@@ -121,6 +127,7 @@ class RiskController:
 
     def update_portfolio_value(self, value: float) -> None:
         """Update peak portfolio value for drawdown tracking."""
+        self._current_value = value
         if value > self._peak_value:
             self._peak_value = value
 
