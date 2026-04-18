@@ -73,8 +73,8 @@ ENABLE_CONTINUATION_SHADOW          = False   # Redundant when live is on
 CONTINUATION_ACTIVE_START_SEC       = 240     # Minute 4
 CONTINUATION_ACTIVE_END_SEC         = 600     # Minute 10 (>=5min hold before period end)
 CONTINUATION_LOOKBACK_SEC           = 300     # 5-min rolling
-CONTINUATION_BTC_MIN_MOVE_PCT       = 0.003   # 0.30%
-CONTINUATION_ETH_MIN_MOVE_PCT       = 0.0025  # 0.25%
+CONTINUATION_BTC_MIN_MOVE_PCT       = 0.0025  # 0.25% (relaxed from 0.30% — sweep shows +25% daily EV)
+CONTINUATION_ETH_MIN_MOVE_PCT       = 0.002   # 0.20% (relaxed from 0.25%)
 CONTINUATION_REVERSAL_WINDOW_SEC    = 60
 CONTINUATION_REVERSAL_BLOCK_PCT     = 0.0012  # 0.12% peak-to-current counter-move
 CONTINUATION_SIZE_MULT              = 0.55
