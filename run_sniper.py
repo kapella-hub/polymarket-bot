@@ -82,6 +82,9 @@ CONTINUATION_MAX_TRADES_PER_PERIOD  = 1
 # Separate price cap for continuation — fires AFTER market move, so entry naturally higher.
 # Break-even at 0.88 = 89.8% WR; backtest 91.7% keeps positive EV margin.
 CONTINUATION_MAX_ENTRY_PRICE        = 0.88
+# Lower depth floor for continuation: position size is 0.55x (~$8-13), not burst's $8-25.
+# Observed 2026-04-18 11:40 UTC: BTC -0.378%, ETH -0.498% clean signal blocked by $20 floor.
+CONTINUATION_MIN_BOOK_VOLUME        = 10.0
 
 
 def _get_price_at(history: deque, target_ts: float) -> float | None:
@@ -535,7 +538,7 @@ async def main():
                             side = "buy_up" if direction == "up" else "buy_down"
                             token_id = market["up_token_id"] if direction == "up" else market["down_token_id"]
                             best_ask, ask_usd_vol = await get_clob_ask(http, token_id)
-                            if ask_usd_vol < MIN_BOOK_VOLUME:
+                            if ask_usd_vol < CONTINUATION_MIN_BOOK_VOLUME:
                                 skip_reason = "depth_fail"
                             else:
                                 entry_price = best_ask if best_ask > 0 else (
