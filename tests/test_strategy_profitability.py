@@ -12,6 +12,12 @@ from run_certainty_sniper import (
 from run_sniper import continuation_signal_score
 from run_sniper import continuation_asset_is_tradeable, continuation_move_gate, continuation_target_size
 from run_maker_shadow import maker_quote_price
+from run_certainty_v2_shadow import (
+    certainty_v2_confirm_count,
+    certainty_v2_confirm_threshold,
+    certainty_v2_move_threshold,
+    certainty_v2_signal_score,
+)
 
 
 class TestCertaintyAdaptiveThresholds:
@@ -120,3 +126,19 @@ class TestMakerShadow:
 
     def test_maker_quote_respects_max_entry(self):
         assert maker_quote_price(0.88, 0.91, 0.88) is None
+
+
+class TestCertaintyV2Shadow:
+    def test_thresholds_relax_later(self):
+        assert certainty_v2_move_threshold(660) < certainty_v2_move_threshold(360)
+        assert certainty_v2_confirm_threshold(660) < certainty_v2_confirm_threshold(360)
+
+    def test_confirm_count_respects_direction(self):
+        moves = {"btc": 0.003, "eth": 0.0025, "sol": -0.001}
+        assert certainty_v2_confirm_count(moves, "up", 0.0022) == 2
+        assert certainty_v2_confirm_count(moves, "down", 0.0022) == 0
+
+    def test_score_prefers_cheaper_supported_entry(self):
+        weak = certainty_v2_signal_score(0.003, 0.0028, 2, 0.05, 0.84, 12.0)
+        strong = certainty_v2_signal_score(0.0045, 0.0028, 3, 0.25, 0.72, 35.0)
+        assert strong > weak

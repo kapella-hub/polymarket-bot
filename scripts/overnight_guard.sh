@@ -6,6 +6,8 @@ API_URL="${PM_BOT_URL:-http://127.0.0.1:8075}"
 DATA_DIR="$BOT_DIR/data"
 STATE_FILE="$DATA_DIR/overnight_guard_state.json"
 REPORT_FILE="$DATA_DIR/overnight_guard_report.log"
+DISABLE_SNIPER_FLAG="$DATA_DIR/disable_sniper.flag"
+DISABLE_CERTAINTY_FLAG="$DATA_DIR/disable_certainty.flag"
 
 SNIPER_CMD=(/opt/polymarket-bot/venv/bin/python3 -u /opt/polymarket-bot/run_sniper.py 604800 151.248)
 CERTAINTY_CMD=(/opt/polymarket-bot/venv/bin/python3 -u /opt/polymarket-bot/run_certainty_sniper.py 604800 50.0)
@@ -83,7 +85,17 @@ restart_count() {
 
 disabled_flag() {
   local svc="$1"
-  json_get "disabled.$svc" | tr -d '"'
+  local state_flag
+  state_flag="$(json_get "disabled.$svc" | tr -d '"')"
+  if [[ "$svc" == "sniper" && -f "$DISABLE_SNIPER_FLAG" ]]; then
+    echo "true"
+    return
+  fi
+  if [[ "$svc" == "certainty" && -f "$DISABLE_CERTAINTY_FLAG" ]]; then
+    echo "true"
+    return
+  fi
+  echo "$state_flag"
 }
 
 increment_restart() {
