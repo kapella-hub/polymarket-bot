@@ -721,7 +721,8 @@ async def all_status():
                    "win_rate": "--", "open": 0, "btc": 0, "period_elapsed": "",
                    "circuit": "ok", "recent_trades": [], "recent_resolved": [],
                    "boundary_enabled": False, "continuation_enabled": True,
-                   "recent_continuation": [], "recent_skips": []},
+                   "recent_continuation": [], "recent_skips": [],
+                   "scorecard": {"live": {}, "shadow_by_coin": {}, "skip_reasons": {}}},
         "certainty_sniper": {"bankroll": 0, "pnl": 0, "wins": 0, "losses": 0,
                              "win_rate": "--", "open": 0, "btc": 0, "period_elapsed": "",
                              "circuit": "ok", "recent_trades": [], "recent_resolved": [],
@@ -743,6 +744,47 @@ async def all_status():
             elif m.group(3):
                 parts[m.group(3)] = m.group(4)
         return parts
+
+    def _safe_float(v):
+        try:
+            return float(v)
+        except Exception:
+            try:
+                return float(str(v).replace("$", "").replace("+", ""))
+            except Exception:
+                return 0.0
+
+    def _trade_scorecard(trades):
+        closed = [t for t in trades if t.get("status") in ("won", "lost", "shadow_won", "shadow_lost")]
+        wins = sum(1 for t in closed if t.get("status") in ("won", "shadow_won"))
+        losses = sum(1 for t in closed if t.get("status") in ("lost", "shadow_lost"))
+        pnl = sum(_safe_float(t.get("pnl", 0)) for t in closed)
+        avg_entry = (
+            sum(_safe_float(t.get("entry_price", 0)) for t in closed) / len(closed)
+            if closed else 0.0
+        )
+        avg_score = (
+            sum(_safe_float(t.get("signal_score", 0)) for t in closed) / len(closed)
+            if closed else 0.0
+        )
+        avg_pnl = (pnl / len(closed)) if closed else 0.0
+        return {
+            "count": len(closed),
+            "wins": wins,
+            "losses": losses,
+            "win_rate": (wins / len(closed)) if closed else 0.0,
+            "realized_pnl": pnl,
+            "ev_per_trade": avg_pnl,
+            "avg_entry": avg_entry,
+            "avg_score": avg_score,
+        }
+
+    def _skip_reason_counts(rows):
+        counts = {}
+        for row in rows:
+            reason = row.get("reason", "unknown")
+            counts[reason] = counts.get(reason, 0) + 1
+        return dict(sorted(counts.items(), key=lambda kv: kv[1], reverse=True))
 
     # --- Momentum Sniper bot ---
     slog = base / "sniper_output.log"
@@ -802,6 +844,31 @@ async def all_status():
                 "recent_resolved": resolved[-10:],
                 "recent_continuation": continuation[-10:],
                 "recent_skips": recent_skips[-10:],
+            }
+        except Exception:
+            pass
+
+    sniper_state = base / "data" / "sniper_state.json"
+    if sniper_state.exists():
+        try:
+            sniper_json = jsonmod.loads(sniper_state.read_text())
+            live_trades = [
+                t for t in sniper_json.get("trades", [])
+                if t.get("strategy_mode") == "continuation"
+            ]
+            shadow_trades = [
+                t for t in sniper_json.get("shadow_trades", [])
+                if t.get("strategy_mode") == "continuation_shadow"
+            ]
+            shadow_by_coin = {}
+            for coin in sorted({t.get("coin", "") for t in shadow_trades if t.get("coin")}):
+                shadow_by_coin[coin] = _trade_scorecard(
+                    [t for t in shadow_trades if t.get("coin") == coin]
+                )
+            result["sniper"]["scorecard"] = {
+                "live": _trade_scorecard(live_trades),
+                "shadow_by_coin": shadow_by_coin,
+                "skip_reasons": _skip_reason_counts(result["sniper"].get("recent_skips", [])),
             }
         except Exception:
             pass

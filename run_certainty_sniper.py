@@ -53,6 +53,7 @@ FILL_LOG_FILE = Path(__file__).parent / "data" / "certainty_fill_journal.jsonl"
 COINS         = ["btc", "eth", "sol", "xrp", "doge", "bnb"]
 COIN_TO_ASSET = {"btc": "BTC", "eth": "ETH", "sol": "SOL",
                  "xrp": "XRP", "doge": "DOGE", "bnb": "BNB"}
+CERTAINTY_ACTIVE_COINS = ("btc", "eth", "sol", "bnb")
 BOOK_MIN_BY_COIN = {
     "btc": 20.0,
     "eth": 16.0,
@@ -63,16 +64,16 @@ BOOK_MIN_BY_COIN = {
 }
 
 # Timing
-CERTAINTY_START  = 720   # 12 min into period — start checking
-CERTAINTY_END    = 840   # 14 min into period — keep a wider window and let scoring reject poor late entries
-CHECK_INTERVAL   = 30    # Check every 30s in window
+CERTAINTY_START  = 630   # 10.5 min into period — earlier entries are cheaper and still highly informative
+CERTAINTY_END    = 810   # 13.5 min into period — stop before the market becomes near-resolved and untradeable
+CHECK_INTERVAL   = 10    # Late-period books can change quickly; poll often enough to catch temporary liquidity
 MAX_OPEN_TRADES  = 2     # Avoid over-concentrating when multiple coins fire together
 
 # Signal thresholds
 MIN_MOVE_PCT       = 0.0055  # Base move gate; effective threshold tightens/loosens with elapsed time
 CONFIRM_MOVE_PCT   = 0.0035  # Base confirm threshold; breadth is scored, not just hard-filtered
 MIN_CONFIRMING     = 2       # Includes the target coin
-MAX_ENTRY_PRICE    = 0.92   # Skip if market already priced certainty in
+MAX_ENTRY_PRICE    = 0.88   # Hard cap; above this the payout buffer is too thin to justify the trade
 MIN_SIGNAL_SCORE   = 1.75   # Minimum composite score to trade
 
 # Sizing
@@ -257,6 +258,10 @@ def count_coin_trades_today(trades: list[dict], coin: str, today: str) -> int:
     return count
 
 
+def certainty_coin_is_tradeable(coin: str) -> bool:
+    return coin in CERTAINTY_ACTIVE_COINS
+
+
 def target_size_usd(bankroll: float, ask_usd_vol: float, coin: str) -> float:
     """Size by bankroll, then clip to a fraction of visible ask liquidity."""
     base_size = min(kelly_size(bankroll), bankroll - 5)
@@ -436,13 +441,19 @@ async def main():
     loop = asyncio.get_running_loop()
 
     state = load_state()
-    if bankroll_init > 0:
+    if bankroll_init > 0 and state.get("bankroll", 0) <= 0 and not state.get("trades"):
         state["bankroll"] = bankroll_init
         state["daily_start_bankroll"] = bankroll_init
         state["daily_start_date"] = datetime.now(timezone.utc).date().isoformat()
         save_state(state)
 
-    bankroll = state["bankroll"]
+    bankroll = state.get("bankroll", 0.0)
+    if bankroll <= 0 and bankroll_init > 0:
+        bankroll = bankroll_init
+        state["bankroll"] = bankroll
+        state["daily_start_bankroll"] = bankroll_init
+        state["daily_start_date"] = datetime.now(timezone.utc).date().isoformat()
+        save_state(state)
     consecutive_losses = state.get("consecutive_losses", 0)
     skip_signals = state.get("skip_signals", 0)
 
@@ -648,6 +659,8 @@ async def main():
                 candidates: list[dict] = []
 
                 for coin in COINS:
+                    if not certainty_coin_is_tradeable(coin):
+                        continue
                     if coin in fired_this_period:
                         continue
                     if active_positions >= MAX_OPEN_TRADES:
@@ -698,7 +711,6 @@ async def main():
                         logger.info("certainty_skip_thin_book",
                                     coin=coin, ask_vol_usd=round(ask_usd_vol, 1),
                                     min_book_usd=min_book_usd)
-                        fired_this_period.add(coin)
                         continue
 
                     entry_price = round(clob_ask, 4)
@@ -707,7 +719,6 @@ async def main():
                         logger.info("certainty_skip",
                                     reason="entry_too_high",
                                     coin=coin, price=entry_price)
-                        fired_this_period.add(coin)
                         continue
 
                     size_usd = target_size_usd(bankroll, ask_usd_vol, coin)
@@ -727,7 +738,6 @@ async def main():
                                     coin=coin,
                                     ask_vol_usd=round(ask_usd_vol, 1),
                                     take_pct=BOOK_TAKE_PCT)
-                        fired_this_period.add(coin)
                         continue
 
                     score = certainty_signal_score(

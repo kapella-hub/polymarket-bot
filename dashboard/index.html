@@ -149,6 +149,10 @@ function render() {
   const positions  = D.open_positions || [];
   const cs = D.certainty_sniper || {};
   const allocations = D.strategy_allocations || [];
+  const sniperScorecard = sn.scorecard || {};
+  const liveScore = sniperScorecard.live || {};
+  const shadowByCoin = sniperScorecard.shadow_by_coin || {};
+  const skipReasons = sniperScorecard.skip_reasons || {};
 
   const gtaPaid      = positions.reduce((s,p) => s + (p.size||0), 0);
   const gtaPotential = positions.reduce((s,p) => s + (p.tokens||0) * 0.90, 0);
@@ -217,6 +221,59 @@ function render() {
       allocSection.append(item);
     }
     app.append(allocSection);
+  }
+
+  if ((liveScore.count||0) || Object.keys(shadowByCoin).length || Object.keys(skipReasons).length) {
+    const scoreSection = el('div', 'section');
+    scoreSection.append(el('div', 'section-title', 'Strategy Scorecard'));
+
+    if ((liveScore.count||0) > 0) {
+      const item = el('div', 'pos-item');
+      const left = el('div', 'pos-left');
+      left.append(el('div', 'pos-name', 'Live Continuation'));
+      left.append(el('div', 'pos-detail',
+        (liveScore.count||0) + ' trades · WR ' + Math.round((liveScore.win_rate||0) * 100) + '%'
+        + ' · avg entry ' + usd(liveScore.avg_entry||0)
+        + ' · avg score ' + Number(liveScore.avg_score||0).toFixed(2)));
+      item.append(left);
+      const right = el('div', 'pos-right');
+      const ev = Number(liveScore.ev_per_trade||0);
+      right.append(el('div', 'pos-value ' + (ev >= 0 ? 'pos' : 'neg'), (ev >= 0 ? '+' : '') + usd(ev)));
+      right.append(el('div', 'pos-profit', 'EV / trade'));
+      item.append(right);
+      scoreSection.append(item);
+    }
+
+    for (const [coin, stats] of Object.entries(shadowByCoin)) {
+      const item = el('div', 'pos-item');
+      const left = el('div', 'pos-left');
+      left.append(el('div', 'pos-name', coin.toUpperCase() + ' Shadow'));
+      left.append(el('div', 'pos-detail',
+        (stats.count||0) + ' trades · WR ' + Math.round((stats.win_rate||0) * 100) + '%'
+        + ' · avg entry ' + usd(stats.avg_entry||0)
+        + ' · avg score ' + Number(stats.avg_score||0).toFixed(2)));
+      item.append(left);
+      const right = el('div', 'pos-right');
+      const ev = Number(stats.ev_per_trade||0);
+      right.append(el('div', 'pos-value ' + (ev >= 0 ? 'pos' : 'neg'), (ev >= 0 ? '+' : '') + usd(ev)));
+      right.append(el('div', 'pos-profit', 'shadow EV / trade'));
+      item.append(right);
+      scoreSection.append(item);
+    }
+
+    if (Object.keys(skipReasons).length) {
+      const item = el('div', 'pos-item');
+      const left = el('div', 'pos-left');
+      left.append(el('div', 'pos-name', 'Skip Distribution'));
+      left.append(el('div', 'pos-detail',
+        Object.entries(skipReasons).slice(0,4).map(([reason, count]) =>
+          reason.replaceAll('_',' ') + ' ' + count).join(' · ')));
+      item.append(left);
+      item.append(badge('Current Filters', 'badge-grey'));
+      scoreSection.append(item);
+    }
+
+    app.append(scoreSection);
   }
 
   // ── Intraday Sniper ───────────────────────────
